@@ -54,6 +54,17 @@ The host needs a **persistent disk**, because the database is a file in `data/`.
 
 Start command: `npm start`.
 
+### On your own Ubuntu server (e.g. Oracle Cloud Always Free)
+
+From Git Bash on your PC, with the server's IP and a domain pointing at it:
+
+```
+bash deploy/deploy.sh <server-ip> <domain> --with-data   # first time: also copies data/
+bash deploy/deploy.sh <server-ip> <domain>               # later updates (commit first)
+```
+
+It installs Node and Caddy (free automatic HTTPS), runs the app as a service that restarts itself, and backs the database up daily to `/var/lib/prov-app/backups`. Later updates never overwrite the data on the server.
+
 ## Tests
 
 ```
