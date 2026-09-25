@@ -1,0 +1,17 @@
+{
+  "name": "prov-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rwanda driving-theory learning app with admin panel and MoMo payment approval",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "create-admin": "node scripts/create-admin.js",
+    "icons": "node scripts/make-icons.js",
+    "test": "node --test \"test/*.test.js\""
+  }
+}
