@@ -1,67 +1,126 @@
 # Provisoire Yanjye
 
-Driving-theory practice app for Rwanda's provisional licence exam. Learners practise and take timed mock exams. They get a set number of questions for free and unlock the rest by paying with MoMo, and an admin confirms each payment.
+Driving-theory practice app for Rwanda's provisional licence exam. Learners practise and take timed mock exams. After creating an account they get a free trial, and they unlock everything by paying with MoMo. An admin confirms each payment.
 
-- Learner app: `/`. Installable on phones and works offline after the first visit. Kinyarwanda, English and French.
-- Admin panel: `/admin`. Payments, learners, questions, import and settings.
-- Needs Node.js 22.13 or newer. One package: `pg` (Postgres).
+- **Live:** https://provisoire-yanjye.onrender.com (learners) · https://provisoire-yanjye.onrender.com/admin (admin)
+- **Learner app** (`/`): installable on phones, works offline after the first visit, in Kinyarwanda, English and French.
+- **Admin panel** (`/admin`): dashboard, payments, learners, reviews, questions, import, poster and settings.
+- **Hosting:** free, with no bank card. The app runs on [Render](https://render.com) and the data is in [Supabase](https://supabase.com) (Postgres).
+- **Stack:** Node.js 22.13 or newer, no framework. One package: `pg`.
+
+> Never put passwords, the `DATABASE_URL` or anything from `data/` in this repository. It is public.
+
+## How learners use it
+
+1. **No account, no questions.** Visitors create an account with their name, phone number and a 4–6 digit PIN. Each phone number can have only one account.
+2. **Free trial:** 16 questions, which the admin can change under Settings → **Free trial questions**. The server picks a mix across topics (e.g. Ibyapa and Amategeko) and prefers questions translated into all three languages. Learners can study them, practise them, and take **one trial exam**.
+3. **After the trial exam the account locks** until the learner pays. The lock is kept on the server, so a new phone or a reinstall doesn't reset it.
+4. **Payment:** the learner pays by MoMo Pay (code, USSD or QR on the payment screen) and enters the Transaction ID from their SMS.
+5. **After approval:** all questions, topics, study mode, and the choice to study first or take the exam first. The open app unlocks at once.
+
+"Next" only appears after the learner answers the current question, in both practice and exams.
+
+## Daily admin work
+
+- **Payments:** new payments show up with a counter on the menu. Check the Transaction ID against your MoMo SMS, then click **Approve** or **Reject**.
+- **Learners:** search by name or phone. The buttons are **Give new trial**, **Change phone** (learners ask on WhatsApp), **Reset PIN**, **Block** or **Unblock**, and **Give access** or **Remove access**.
+- **Reviews:** learners who finished a mock exam can rate the app from 1 to 5 stars. You can hide spam or abuse, but don't hide honest criticism.
+- **Settings:** price, MoMo details, WhatsApp number, free questions, daily limits (0 = no limit), and the exam rules (number of questions, minutes, pass mark). **Change admin password** is at the bottom of this page.
+- **Poster:** a printable poster with the QR code and your contact details.
+- The **Dashboard** shows sales, revenue, exams and the admin activity log. The green **Live** dot means updates arrive in real time.
+
+### Adding questions
+
+Admin → **Import** → choose the file (for example `amategeko-yumuhanda.html`) or paste a link → pick its language → check the preview → **Import**.
+
+- **Replace all questions** removes the existing ones first. **Add to the end** keeps them and adds the new ones after.
+- To add a second language, import that language's file with **Add as a translation**. It is matched to the existing questions by their order.
+- Single questions can be added or edited under **Questions**.
+
+## Admin login
+
+- The username is `admin`. The password is not stored here. Keep it somewhere safe (on the owner's PC it is in `data/ADMIN-LOGIN.txt`).
+- **Change it:** Admin → Settings → **Change admin password**. Everyone logged in as admin is logged out.
+- **Too many wrong tries:** after 5 wrong passwords from one internet connection, admin login is locked for 15 minutes. Wait, then type it carefully. A successful login clears the lock.
+- **Forgotten password:** run this on a computer with the code, using the Supabase connection string (PowerShell):
+
+  ```
+  $env:DATABASE_URL = "<Supabase Session pooler string>"
+  npm install
+  npm run create-admin -- admin        # asks for the new password twice
+  Remove-Item Env:DATABASE_URL
+  ```
+
+## Hosting
+
+| Part | Service | Where to manage it |
+|---|---|---|
+| App | Render, free plan, Frankfurt, service `provisoire-yanjye` | render.com → Dashboard |
+| Database | Supabase, free plan, Frankfurt (eu-central-1), project `provisoire-yanjye` | supabase.com → Dashboard |
+| Code | GitHub, `main` branch | this repository |
+
+**Updating the site:** push to `main`. Render builds and deploys by itself in a few minutes, and the data in Supabase is not touched.
+
+**Environment variables on Render** (set by `render.yaml`):
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | Supabase → **Connect** → **Session pooler** string, with the database password in it. Entered by hand in Render, never committed. |
+| `SESSION_SECRET` | Generated by Render. It signs login cookies; changing it logs everyone out. |
+| `NODE_ENV` | `production` (secure cookies and HSTS; needs HTTPS) |
+| `TRUST_PROXY` | `1` (Render sits in front of the app) |
+| `NODE_VERSION` | `24` |
+| `ADMIN_USER`, `ADMIN_PASSWORD` | Only for a brand-new, empty database: creates the first admin on start. Remove them afterwards. |
+
+**Database:** tables are in their own `prov` schema. Row-level security is on and Supabase's API roles have no access, so only the app can read the data. The app creates any missing tables when it starts.
+
+**Free plan limits:**
+- Render sleeps after 15 minutes without visitors, and the next visit then waits about a minute. A free monitor such as [UptimeRobot](https://uptimerobot.com) that opens `https://provisoire-yanjye.onrender.com/api/config` every 5–10 minutes keeps it awake.
+- Supabase pauses a free project after a week without use. The same monitor prevents that.
+- Supabase's free plan has no downloadable backups. Export the data now and then with `supabase db dump` (Supabase CLI) or `pg_dump`.
+
+**If the database password changes** (Supabase → Project Settings → Database → Reset database password), put the new Session pooler string into Render → Environment → `DATABASE_URL`. Render restarts the app.
 
 ## Run it on your computer
 
 ```
-npm run create-admin -- yourname     # asks for a password (10+ characters)
-npm start                            # http://localhost:3000  and  http://localhost:3000/admin
+npm install
+npm run create-admin -- admin     # asks for a password (10+ characters)
+npm start                         # http://localhost:3000  and  http://localhost:3000/admin
 ```
 
-Then, in the admin panel:
-
-1. **Settings**: set your MoMo number, the name on the account, your WhatsApp number and the price. Check the exam rules (questions, minutes, pass mark) against the real exam.
-2. **Import**: load `amategeko-yumuhanda.html` (or a link to it), choose its language, check the preview, and import. To add another language later, import that file with **Add as a translation**.
-
-## Daily use
-
-When a learner pays, they enter the MoMo Transaction ID. It shows up under **Payments** with a counter on the menu. Check it against your MoMo SMS, then click **Approve**. The learner is unlocked on their next refresh.
-
-## Live updates, study mode, reviews
-
-- **Live:** when you approve a payment, the learner's open app unlocks immediately. The admin panel shows new payments, reviews and exam results as they happen (the green "Live" dot in the menu).
-- **Study mode:** every question with its correct answer and explanation, with search and topics. After paying, learners choose to study first or take the exam first. After an exam they can study the answers they got wrong.
-- **Reviews:** learners who have finished a mock exam can rate the app with 1–5 stars and a comment. The app asks right after a pass, and after the second exam. Any learner who has finished an exam can also review from Account. Reviews appear on the home and payment screens once there are 3. Under **Reviews** you can hide spam or abuse. Don't hide honest criticism.
+Without `DATABASE_URL`, the app uses a built-in Postgres (PGlite) stored in `data/pg`. It is separate from the live data and starts empty. `npm run dev` restarts the app when a file changes.
 
 ## Security
 
 - PINs and passwords are stored as scrypt hashes, never as readable text.
-- Logins lock after 5 wrong tries (15 minutes).
-- Sessions are signed, HttpOnly, SameSite=Strict cookies. Blocking a learner or resetting their PIN logs them out everywhere.
-- Paid questions are only sent to paid accounts; the free list is limited on the server.
+- Learner logins lock after 5 wrong PINs, and admin logins after 5 wrong passwords from one connection (15 minutes).
+- Sessions are signed, HttpOnly, SameSite=Strict cookies. Blocking a learner, resetting their PIN or changing their phone logs them out everywhere.
+- Paid questions are only sent to paid accounts, and the free trial is enforced on the server.
 - Every change request must be JSON from the same site (CSRF protection), with a strict Content-Security-Policy.
-- Imports never run the uploaded file. Import links can't reach private or local addresses.
+- Imports never run the uploaded file, and import links can't reach private or local addresses.
 - Every admin action is logged (Dashboard → Recent admin activity).
 
-Keep `data/` private. On your computer it holds the local database and `secret.key`. Online, the data is in Supabase, which backs it up daily.
+## Project layout
 
-## Put it online
-
-Free, with no bank card: the app runs on **Render** and the data lives in **Supabase** (Postgres).
-On your own computer, with no `DATABASE_URL`, the app uses a built-in Postgres (PGlite) in `data/pg` instead.
-
-1. **Supabase:** open the project, click **Connect**, and copy the **Session pooler** connection string. Put your database password in it (Project Settings → Database → Reset database password if you don't have it).
-2. **Render:** New → **Blueprint** → choose this GitHub repository. It reads `render.yaml`. Paste the connection string as `DATABASE_URL`.
-
-The tables are created on first start, in their own `prov` schema that Supabase's public API can't reach.
-
-| Variable | Value |
-|---|---|
-| `DATABASE_URL` | Supabase Session pooler string |
-| `NODE_ENV` | `production` (secure cookies + HSTS; site must be on HTTPS) |
-| `TRUST_PROXY` | `1` behind the host's proxy (Render) |
-| `SESSION_SECRET` | 32+ random characters (Render generates it) |
-| `ADMIN_USER`, `ADMIN_PASSWORD` | only for a brand-new database: creates the first admin on first start. Remove them afterwards. |
-
-Render's free plan sleeps after 15 minutes without visitors, and the next visit waits about a minute. A free monitor (e.g. UptimeRobot) that opens `/api/config` every 10 minutes keeps it awake. That also keeps Supabase from pausing the project after a week without use.
+```
+server.js            web server, security headers, static files
+src/api.js           all API routes (learners and admin)
+src/db.js            database: Postgres via DATABASE_URL, or PGlite locally; tables and settings
+src/auth.js          password hashing, signed cookies, rate limits
+src/importer.js      reads questions from HTML, JS or CSV files and links
+src/live.js          real-time updates (Server-Sent Events)
+public/              learner app (index.html, app.js) and admin panel (admin.html, admin.js)
+scripts/             create-admin, icon generator
+render.yaml          Render setup
+test/api.test.js     end-to-end tests
+```
 
 ## Tests
 
 ```
+npm install
 npm test
 ```
+
+The tests start the app on a temporary PGlite database and check sign-up, the free trial, payments, daily limits, reviews, live updates, import and security.
