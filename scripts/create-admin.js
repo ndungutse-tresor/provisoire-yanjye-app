@@ -2,7 +2,7 @@
 // Usage: npm run create-admin -- <username>
 // Asks for the password without echoing it. Running it again for the same username resets the password.
 const readline = require('node:readline');
-const { db } = require('../src/db');
+const { db, init, close } = require('../src/db');
 const { hashSecret } = require('../src/auth');
 
 const username = (process.argv[2] || '').trim();
@@ -32,7 +32,9 @@ function askHidden(question) {
     process.exit(1);
   }
   const hash = await hashSecret(pass);
-  db.prepare(`INSERT INTO admins(username, pass_hash) VALUES(?, ?)
-    ON CONFLICT(username) DO UPDATE SET pass_hash = excluded.pass_hash, token_version = token_version + 1`).run(username, hash);
+  await init();
+  await db.run(`INSERT INTO admins(username, pass_hash) VALUES(?, ?)
+    ON CONFLICT(username) DO UPDATE SET pass_hash = excluded.pass_hash, token_version = admins.token_version + 1`, username, hash);
+  await close();
   console.log(`Admin "${username}" is ready. Log in at /admin`);
 })();

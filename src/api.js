@@ -1,6 +1,7 @@
 'use strict';
 const {
-  db, tx, getSettings, updateSettings, listQuestions, questionCount, rowToQuestion, saveQuestionData, logAdmin
+  db, tx, NOW, ago, TODAY, isUniqueError,
+  getSettings, updateSettings, listQuestions, questionCount, rowToQuestion, saveQuestionData, logAdmin
 } = require('./db');
 const { hashSecret, verifySecret, burnTime, signToken, verifyToken, parseCookies, cookie, Limiter } = require('./auth');
 const { HttpError, sendJson, readJson } = require('./http');
@@ -51,9 +52,9 @@ function fillPayTemplate(tpl, s) {
     .replace(/\{amount\}/g, String(s.price));
 }
 
-function publicConfig() {
-  const s = getSettings();
-  const cats = db.prepare("SELECT category, COUNT(*) AS n FROM questions WHERE category <> '' GROUP BY category ORDER BY MIN(ord)").all();
+async function publicConfig() {
+  const s = await getSettings();
+  const cats = await db.all("SELECT category, COUNT(*) AS n FROM questions WHERE category <> '' GROUP BY category ORDER BY MIN(ord)");
   return {
     appName: s.app_name,
     price: s.price,
@@ -67,46 +68,48 @@ function publicConfig() {
     freeCount: s.free_count,
     exam: { count: s.exam_count, minutes: s.exam_minutes, passMark: s.pass_mark },
     limits: { questions: s.daily_questions, exams: s.daily_exams },
-    total: questionCount(),
+    total: await questionCount(),
     categories: cats.map((c) => ({ name: c.category, count: c.n }))
   };
 }
 
 function id(v) {
   const n = Number(v);
-  if (!Number.isInteger(n) || n < 1) throw new HttpError(404, 'not_found', 'Not found.');
+  if (!Number.isInteger(n) || n < 1 || n > 2 ** 53) throw new HttpError(404, 'not_found', 'Not found.');
   return n;
 }
 
 function limitOffset(url, max = 200) {
-  const limit = Math.min(max, Math.max(1, Number(url.searchParams.get('limit')) || 50));
-  const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
+  const limit = Math.min(max, Math.max(1, Math.floor(Number(url.searchParams.get('limit'))) || 50));
+  const offset = Math.max(0, Math.floor(Number(url.searchParams.get('offset'))) || 0);
   return { limit, offset };
 }
 
 // ---------- sessions ----------
-function currentUser(ctx) {
+async function currentUser(ctx) {
   if (ctx._user !== undefined) return ctx._user;
   const p = verifyToken(ctx.cookies[USER_COOKIE]);
   let u = null;
-  if (p && p.role === 'user') {
-    u = db.prepare('SELECT * FROM users WHERE id = ?').get(p.uid) || null;
+  if (p && p.role === 'user' && Number.isInteger(p.uid)) {
+    u = (await db.get('SELECT * FROM users WHERE id = ?', p.uid)) || null;
     if (u && (u.blocked || u.token_version !== p.v)) u = null;
-    if (u) db.prepare("UPDATE users SET last_seen = datetime('now') WHERE id = ? AND (last_seen IS NULL OR last_seen < datetime('now', '-10 minutes'))").run(u.id);
+    if (u) {
+      await db.run(`UPDATE users SET last_seen = ${NOW} WHERE id = ? AND (last_seen IS NULL OR last_seen < ${ago('10 minutes')})`, u.id);
+    }
   }
   ctx._user = u;
   return u;
 }
 
-function requireUser(ctx) {
-  const u = currentUser(ctx);
+async function requireUser(ctx) {
+  const u = await currentUser(ctx);
   if (!u) throw new HttpError(401, 'login_required', 'Please log in.');
   return u;
 }
 
-function requireAdmin(ctx) {
+async function requireAdmin(ctx) {
   const p = verifyToken(ctx.cookies[ADMIN_COOKIE]);
-  const a = p && p.role === 'admin' ? db.prepare('SELECT * FROM admins WHERE id = ?').get(p.aid) : null;
+  const a = p && p.role === 'admin' && Number.isInteger(p.aid) ? await db.get('SELECT * FROM admins WHERE id = ?', p.aid) : null;
   if (!a || a.token_version !== p.v) throw new HttpError(401, 'admin_login_required', 'Admin login required.');
   return a;
 }
@@ -187,12 +190,16 @@ route('POST', '/api/auth/register', async (ctx) => {
     throw new HttpError(400, 'weak_pin', 'Choose a PIN that is harder to guess.');
   }
   registerByIp.hit(ctx.ip);
-  if (db.prepare('SELECT 1 FROM users WHERE phone = ?').get(phone)) {
-    throw new HttpError(409, 'phone_taken', 'This number already has an account. Log in, or contact support on WhatsApp.');
-  }
+  const taken = () => new HttpError(409, 'phone_taken', 'This number already has an account. Log in, or contact support on WhatsApp.');
+  if (await db.get('SELECT 1 FROM users WHERE phone = ?', phone)) throw taken();
   const hash = await hashSecret(pin);
-  const r = db.prepare('INSERT INTO users(phone, name, pin_hash) VALUES(?, ?, ?)').run(phone, name, hash);
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid);
+  let u;
+  try {
+    u = (await db.run('INSERT INTO users(phone, name, pin_hash) VALUES(?, ?, ?) RETURNING *', phone, name, hash)).rows[0];
+  } catch (e) {
+    if (isUniqueError(e)) throw taken();   // two sign-ups with the same number at once
+    throw e;
+  }
   setUserSession(ctx, u);
   return { user: publicUser(u) };
 });
@@ -204,7 +211,7 @@ route('POST', '/api/auth/login', async (ctx) => {
   if (!phone || !pin) throw new HttpError(400, 'bad_login', 'Enter your phone number and PIN.');
   if (loginByIp.blocked(ctx.ip)) throw tooMany(loginByIp, ctx.ip);
   if (loginByPhone.blocked(phone)) throw tooMany(loginByPhone, phone);
-  const u = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+  const u = await db.get('SELECT * FROM users WHERE phone = ?', phone);
   const ok = u ? await verifySecret(pin, u.pin_hash) : await burnTime(pin);
   if (!ok) {
     loginByIp.hit(ctx.ip);
@@ -222,14 +229,17 @@ route('POST', '/api/auth/logout', async (ctx) => {
   ctx.setCookies.push(cookie(USER_COOKIE, '', { maxAgeSec: 0, secure: ctx.secure }));
 });
 
-route('GET', '/api/me', (ctx) => {
-  const u = currentUser(ctx);
+route('GET', '/api/me', async (ctx) => {
+  const u = await currentUser(ctx);
   if (!u) return { user: null, payment: null, review: null, examCount: 0 };
-  const p = db.prepare('SELECT id, txid, amount, status, note, created_at FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(u.id);
-  const r = db.prepare('SELECT rating, comment, updated_at FROM reviews WHERE user_id = ?').get(u.id);
-  const examCount = db.prepare('SELECT COUNT(*) AS n FROM exams WHERE user_id = ?').get(u.id).n;
-  const lastExam = db.prepare('SELECT score, total, passed, created_at FROM exams WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(u.id) || null;
-  return { user: publicUser(u), payment: p || null, review: r || null, examCount, lastExam, usage: usageToday(u.id) };
+  const [p, r, count, lastExam, usage] = await Promise.all([
+    db.get('SELECT id, txid, amount, status, note, created_at FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT 1', u.id),
+    db.get('SELECT rating, comment, updated_at FROM reviews WHERE user_id = ?', u.id),
+    db.get('SELECT COUNT(*) AS n FROM exams WHERE user_id = ?', u.id),
+    db.get('SELECT score, total, passed, created_at FROM exams WHERE user_id = ? ORDER BY id DESC LIMIT 1', u.id),
+    usageToday(u.id)
+  ]);
+  return { user: publicUser(u), payment: p || null, review: r || null, examCount: count.n, lastExam: lastExam || null, usage };
 });
 
 // ---------- daily limits ----------
@@ -237,31 +247,32 @@ route('GET', '/api/me', (ctx) => {
 function today() {
   return new Date(Date.now() + 2 * 3600e3).toISOString().slice(0, 10);
 }
-function usageToday(uid) {
+async function usageToday(uid, t = db) {
   const day = today();
-  return {
-    day,
-    questions: db.prepare('SELECT COUNT(*) AS n FROM usage_seen WHERE user_id = ? AND day = ?').get(uid, day).n,
-    exams: db.prepare('SELECT COUNT(*) AS n FROM exam_starts WHERE user_id = ? AND day = ?').get(uid, day).n
-  };
+  const q = await t.get('SELECT COUNT(*) AS n FROM usage_seen WHERE user_id = ? AND day = ?', uid, day);
+  const e = await t.get('SELECT COUNT(*) AS n FROM exam_starts WHERE user_id = ? AND day = ?', uid, day);
+  return { day, questions: q.n, exams: e.n };
 }
 
 // The app reports which questions were opened (studied or practised). New ones beyond
 // the daily limit are refused, so the count can't be pushed past it.
 route('POST', '/api/usage', async (ctx) => {
   const b = await readJson(ctx.req);
-  const u = requireUser(ctx);
-  const ids = Array.isArray(b.seen) ? b.seen.slice(0, 500).map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
-  const limit = getSettings().daily_questions;
+  const u = await requireUser(ctx);
+  const ids = Array.isArray(b.seen)
+    ? [...new Set(b.seen.slice(0, 500).map(Number).filter((n) => Number.isInteger(n) && n > 0 && n < 2 ** 53))]
+    : [];
+  const limit = (await getSettings()).daily_questions;
   const day = today();
-  const has = db.prepare('SELECT 1 FROM usage_seen WHERE user_id = ? AND day = ? AND qid = ?');
-  const ins = db.prepare('INSERT OR IGNORE INTO usage_seen(user_id, day, qid) SELECT ?, ?, id FROM questions WHERE id = ?');
-  tx(() => {
-    let used = db.prepare('SELECT COUNT(*) AS n FROM usage_seen WHERE user_id = ? AND day = ?').get(u.id, day).n;
+  await tx(async (t) => {
+    // One request per learner at a time, so parallel requests can't pass the limit together.
+    await t.get('SELECT id FROM users WHERE id = ? FOR UPDATE', u.id);
+    let used = (await t.get('SELECT COUNT(*) AS n FROM usage_seen WHERE user_id = ? AND day = ?', u.id, day)).n;
     for (const q of ids) {
-      if (has.get(u.id, day, q)) continue;
+      if (await t.get('SELECT 1 FROM usage_seen WHERE user_id = ? AND day = ? AND qid = ?', u.id, day, q)) continue;
       if (limit && used >= limit) break;
-      used += ins.run(u.id, day, q).changes;
+      used += (await t.run(`INSERT INTO usage_seen(user_id, day, qid) SELECT ?::bigint, ?::text, id FROM questions WHERE id = ?
+        ON CONFLICT DO NOTHING`, u.id, day, q)).changes;
     }
   });
   return usageToday(u.id);
@@ -269,33 +280,35 @@ route('POST', '/api/usage', async (ctx) => {
 
 route('POST', '/api/exams/start', async (ctx) => {
   await readJson(ctx.req);
-  const u = requireUser(ctx);
+  const u = await requireUser(ctx);
   if (!u.paid && u.trial_done) throw new HttpError(403, 'trial_used', 'Your free trial is finished. Unlock to continue.');
-  const limit = getSettings().daily_exams;
-  const used = usageToday(u.id).exams;
-  if (u.paid && limit && used >= limit) {
-    throw new HttpError(429, 'daily_exam_limit', `You can take ${limit} exam(s) a day. Come back tomorrow.`);
-  }
-  db.prepare('INSERT INTO exam_starts(user_id, day) VALUES(?, ?)').run(u.id, today());
-  return usageToday(u.id);
+  const limit = (await getSettings()).daily_exams;
+  return tx(async (t) => {
+    await t.get('SELECT id FROM users WHERE id = ? FOR UPDATE', u.id);
+    const used = (await usageToday(u.id, t)).exams;
+    if (u.paid && limit && used >= limit) {
+      throw new HttpError(429, 'daily_exam_limit', `You can take ${limit} exam(s) a day. Come back tomorrow.`);
+    }
+    await t.run('INSERT INTO exam_starts(user_id, day) VALUES(?, ?)', u.id, today());
+    return usageToday(u.id, t);
+  });
 });
 
 // Live channel: tells the learner's open app when their account changes.
-route('GET', '/api/events', (ctx) => {
-  const u = requireUser(ctx);
+route('GET', '/api/events', async (ctx) => {
+  const u = await requireUser(ctx);
   live.subscribeUser(u.id, ctx.res);
   return STREAM;
 });
 
 // ---------- exam results ----------
-function passMarkFor(total) {
-  const s = getSettings();
+function passMarkFor(total, s) {
   return total < s.exam_count ? Math.ceil(s.pass_mark * total / s.exam_count) : s.pass_mark;
 }
 
 route('POST', '/api/exams', async (ctx) => {
   const b = await readJson(ctx.req);
-  const u = requireUser(ctx);
+  const u = await requireUser(ctx);
   const score = Number(b.score), total = Number(b.total);
   if (!Number.isInteger(total) || total < 1 || total > 500 || !Number.isInteger(score) || score < 0 || score > total) {
     throw new HttpError(400, 'bad_exam', 'Invalid exam result.');
@@ -304,10 +317,10 @@ route('POST', '/api/exams', async (ctx) => {
   if (!u.paid && u.trial_done) throw new HttpError(403, 'trial_used', 'Your free trial is finished. Unlock to continue.');
   if (examsByUser.blocked(u.id)) throw tooMany(examsByUser, u.id);
   examsByUser.hit(u.id);
-  const passed = score >= passMarkFor(total);
-  tx(() => {
-    db.prepare('INSERT INTO exams(user_id, score, total, passed) VALUES(?, ?, ?, ?)').run(u.id, score, total, passed ? 1 : 0);
-    if (!u.paid) db.prepare('UPDATE users SET trial_done = 1 WHERE id = ?').run(u.id);
+  const passed = score >= passMarkFor(total, await getSettings());
+  await tx(async (t) => {
+    await t.run('INSERT INTO exams(user_id, score, total, passed) VALUES(?, ?, ?, ?)', u.id, score, total, passed ? 1 : 0);
+    if (!u.paid) await t.run('UPDATE users SET trial_done = 1 WHERE id = ?', u.id);
   });
   live.toAdmins('exam', { passed });
   return { passed, trialDone: !u.paid };
@@ -319,13 +332,16 @@ function reviewerName(name) {
   return parts[0] + (parts[1] ? ' ' + parts[1].charAt(0).toUpperCase() + '.' : '');
 }
 
-function reviewSummary() {
-  const agg = db.prepare("SELECT COUNT(*) AS n, AVG(rating) AS avg FROM reviews WHERE status = 'published'").get();
+async function reviewSummary() {
+  const [agg, dists, recent] = await Promise.all([
+    db.get("SELECT COUNT(*) AS n, AVG(rating) AS avg FROM reviews WHERE status = 'published'"),
+    db.all("SELECT rating, COUNT(*) AS n FROM reviews WHERE status = 'published' GROUP BY rating"),
+    db.all(`SELECT r.rating, r.comment, r.updated_at, u.name, u.paid FROM reviews r JOIN users u ON u.id = r.user_id
+      WHERE r.status = 'published' AND r.comment IS NOT NULL AND r.comment <> ''
+      ORDER BY r.updated_at DESC LIMIT 12`)
+  ]);
   const dist = [0, 0, 0, 0, 0];
-  for (const r of db.prepare("SELECT rating, COUNT(*) AS n FROM reviews WHERE status = 'published' GROUP BY rating").all()) dist[r.rating - 1] = r.n;
-  const recent = db.prepare(`SELECT r.rating, r.comment, r.updated_at, u.name, u.paid FROM reviews r JOIN users u ON u.id = r.user_id
-    WHERE r.status = 'published' AND r.comment IS NOT NULL AND r.comment <> ''
-    ORDER BY r.updated_at DESC LIMIT 12`).all();
+  for (const r of dists) dist[r.rating - 1] = r.n;
   return {
     count: agg.n,
     average: agg.n ? Math.round(agg.avg * 10) / 10 : 0,
@@ -338,8 +354,8 @@ route('GET', '/api/reviews', () => reviewSummary());
 
 route('POST', '/api/reviews', async (ctx) => {
   const b = await readJson(ctx.req);
-  const u = requireUser(ctx);
-  if (!db.prepare('SELECT 1 FROM exams WHERE user_id = ?').get(u.id)) {
+  const u = await requireUser(ctx);
+  if (!(await db.get('SELECT 1 FROM exams WHERE user_id = ? LIMIT 1', u.id))) {
     throw new HttpError(403, 'exam_first', 'Finish a mock exam before writing a review.');
   }
   const rating = Number(b.rating);
@@ -348,9 +364,9 @@ route('POST', '/api/reviews', async (ctx) => {
   if (comment.length > 500) throw new HttpError(400, 'bad_comment', 'Keep the review under 500 characters.');
   if (reviewsByUser.blocked(u.id)) throw tooMany(reviewsByUser, u.id);
   reviewsByUser.hit(u.id);
-  db.prepare(`INSERT INTO reviews(user_id, rating, comment) VALUES(?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET rating = excluded.rating, comment = excluded.comment, updated_at = datetime('now')`)
-    .run(u.id, rating, comment || null);
+  await db.run(`INSERT INTO reviews(user_id, rating, comment) VALUES(?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET rating = excluded.rating, comment = excluded.comment, updated_at = ${NOW}`,
+  u.id, rating, comment || null);
   live.toAdmins('review', { rating });
   return { rating, comment };
 });
@@ -358,8 +374,8 @@ route('POST', '/api/reviews', async (ctx) => {
 // The free trial set: mixed across topics (e.g. Ibyapa and Amategeko), preferring questions
 // translated into every language. Questions without a topic are split into signs (with a
 // picture) and rules (without). Returned interleaved, so the mix shows from the first question.
-function freeQuestionList(n) {
-  const all = listQuestions(null);
+async function freeQuestionList(n) {
+  const all = await listQuestions(null);
   if (all.length <= n) return all;
   const complete = (q) => LANGS.every((l) => q.text[l]);
   const groups = new Map();
@@ -382,37 +398,42 @@ function freeQuestionList(n) {
 
 // No account: no questions. Unpaid account: the free trial. Paid: everything.
 // Paid questions only ever leave the server for paid accounts.
-route('GET', '/api/questions', (ctx) => {
-  const u = currentUser(ctx);
-  const s = getSettings();
-  const total = questionCount();
+route('GET', '/api/questions', async (ctx) => {
+  const u = await currentUser(ctx);
+  const s = await getSettings();
+  const total = await questionCount();
   const freeCount = Math.min(s.free_count, total);
   if (!u) return { full: false, total, freeCount, needAccount: true, questions: [] };
-  if (u.paid) return { full: true, total, freeCount, questions: listQuestions(null) };
+  if (u.paid) return { full: true, total, freeCount, questions: await listQuestions(null) };
   // Trial used up: locked until payment (kept on the server, so a new phone or reinstall doesn't reset it).
   if (u.trial_done) return { full: false, total, freeCount, trialDone: true, questions: [] };
-  return { full: false, total, freeCount, questions: freeQuestionList(s.free_count) };
+  return { full: false, total, freeCount, questions: await freeQuestionList(s.free_count) };
 });
 
 route('POST', '/api/payments', async (ctx) => {
   const b = await readJson(ctx.req);
-  const u = requireUser(ctx);
+  const u = await requireUser(ctx);
   if (u.paid) throw new HttpError(400, 'already_paid', 'Your account is already unlocked.');
   const txid = String(b.txid || '').replace(/\s+/g, '').toUpperCase();
   if (!/^[A-Z0-9.\-]{6,40}$/.test(txid)) throw new HttpError(400, 'bad_txid', 'Enter the transaction ID from your MoMo SMS.');
   const payer = b.payer ? normPhone(b.payer) : u.phone;
   if (b.payer && !payer) throw new HttpError(400, 'bad_phone', 'The number that paid is not valid.');
   if (payByUser.blocked(u.id)) throw tooMany(payByUser, u.id);
-  if (db.prepare("SELECT 1 FROM payments WHERE user_id = ? AND status = 'pending'").get(u.id)) {
-    throw new HttpError(409, 'pending_exists', 'Your payment is already waiting for confirmation.');
-  }
+  const price = (await getSettings()).price;
   payByUser.hit(u.id);
-  try {
-    db.prepare('INSERT INTO payments(user_id, txid, payer, amount) VALUES(?, ?, ?, ?)').run(u.id, txid, payer, getSettings().price);
-  } catch (e) {
-    if (/UNIQUE/i.test(e.message)) throw new HttpError(409, 'txid_used', 'This transaction ID was already used.');
+  await tx(async (t) => {
+    await t.get('SELECT id FROM users WHERE id = ? FOR UPDATE', u.id);
+    if (await t.get("SELECT 1 FROM payments WHERE user_id = ? AND status = 'pending'", u.id)) {
+      throw new HttpError(409, 'pending_exists', 'Your payment is already waiting for confirmation.');
+    }
+    if (await t.get('SELECT 1 FROM payments WHERE txid = ?', txid)) {
+      throw new HttpError(409, 'txid_used', 'This transaction ID was already used.');
+    }
+    await t.run('INSERT INTO payments(user_id, txid, payer, amount) VALUES(?, ?, ?, ?)', u.id, txid, payer, price);
+  }).catch((e) => {
+    if (isUniqueError(e)) throw new HttpError(409, 'txid_used', 'This transaction ID was already used.');
     throw e;
-  }
+  });
   live.toAdmins('payment', { name: u.name });
 });
 
@@ -420,7 +441,7 @@ route('POST', '/api/payments', async (ctx) => {
 route('POST', '/api/admin/login', async (ctx) => {
   const b = await readJson(ctx.req);
   if (adminByIp.blocked(ctx.ip)) throw tooMany(adminByIp, ctx.ip);
-  const a = db.prepare('SELECT * FROM admins WHERE username = ?').get(String(b.username || '').trim());
+  const a = await db.get('SELECT * FROM admins WHERE username = ?', String(b.username || '').trim());
   const ok = a ? await verifySecret(String(b.password || ''), a.pass_hash) : await burnTime(String(b.password || ''));
   if (!ok) {
     adminByIp.hit(ctx.ip);
@@ -429,7 +450,7 @@ route('POST', '/api/admin/login', async (ctx) => {
   adminByIp.clear(ctx.ip);
   const token = signToken({ role: 'admin', aid: a.id, v: a.token_version, exp: Date.now() + ADMIN_HOURS * 3600e3 });
   ctx.setCookies.push(cookie(ADMIN_COOKIE, token, { maxAgeSec: ADMIN_HOURS * 3600, path: '/api/admin', secure: ctx.secure }));
-  logAdmin(a.username, 'login', ctx.ip);
+  await logAdmin(a.username, 'login', ctx.ip);
   return { username: a.username };
 });
 
@@ -438,68 +459,77 @@ route('POST', '/api/admin/logout', async (ctx) => {
   ctx.setCookies.push(cookie(ADMIN_COOKIE, '', { maxAgeSec: 0, path: '/api/admin', secure: ctx.secure }));
 });
 
-route('GET', '/api/admin/me', (ctx) => ({ username: requireAdmin(ctx).username }));
+route('GET', '/api/admin/me', async (ctx) => ({ username: (await requireAdmin(ctx)).username }));
 
 route('POST', '/api/admin/password', async (ctx) => {
   const b = await readJson(ctx.req);
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   if (!(await verifySecret(String(b.current || ''), a.pass_hash))) throw new HttpError(400, 'bad_password', 'Current password is wrong.');
   const next = String(b.next || '');
   if (next.length < 10) throw new HttpError(400, 'weak_password', 'Use at least 10 characters.');
-  db.prepare('UPDATE admins SET pass_hash = ?, token_version = token_version + 1 WHERE id = ?').run(await hashSecret(next), a.id);
-  logAdmin(a.username, 'password_changed');
+  await db.run('UPDATE admins SET pass_hash = ?, token_version = token_version + 1 WHERE id = ?', await hashSecret(next), a.id);
+  await logAdmin(a.username, 'password_changed');
   ctx.setCookies.push(cookie(ADMIN_COOKIE, '', { maxAgeSec: 0, path: '/api/admin', secure: ctx.secure }));
 });
 
-route('GET', '/api/admin/stats', (ctx) => {
-  requireAdmin(ctx);
-  const one = (sql) => db.prepare(sql).get();
-  const users = one('SELECT COUNT(*) AS n, SUM(paid) AS paid FROM users');
-  const money = one("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'approved'");
-  const month = one("SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'approved' AND decided_at >= date('now', 'start of month')");
-  const days = db.prepare(`SELECT date(decided_at) AS day, COUNT(*) AS sales, SUM(amount) AS revenue
-    FROM payments WHERE status = 'approved' AND decided_at >= date('now', '-13 days') GROUP BY day ORDER BY day`).all();
+route('GET', '/api/admin/stats', async (ctx) => {
+  await requireAdmin(ctx);
+  const one = (sql) => db.get(sql);
+  const [users, money, month, days, newToday, pending, questions, exams, examsToday, reviews, log] = await Promise.all([
+    one('SELECT COUNT(*) AS n, SUM(paid) AS paid FROM users'),
+    one("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'approved'"),
+    one(`SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'approved' AND decided_at >= left(${NOW}, 7) || '-01'`),
+    db.all(`SELECT left(decided_at, 10) AS day, COUNT(*) AS sales, SUM(amount) AS revenue
+      FROM payments WHERE status = 'approved' AND decided_at >= left(${ago('13 days')}, 10) GROUP BY day ORDER BY day`),
+    one(`SELECT COUNT(*) AS n FROM users WHERE created_at >= ${TODAY}`),
+    one("SELECT COUNT(*) AS n FROM payments WHERE status = 'pending'"),
+    questionCount(),
+    one('SELECT COUNT(*) AS n, COALESCE(SUM(passed), 0) AS passed FROM exams'),
+    one(`SELECT COUNT(*) AS n FROM exams WHERE created_at >= ${TODAY}`),
+    one("SELECT COUNT(*) AS n, COALESCE(AVG(rating), 0) AS avg FROM reviews WHERE status = 'published'"),
+    db.all('SELECT admin, action, detail, at FROM admin_log ORDER BY id DESC LIMIT 15')
+  ]);
   return {
     users: users.n,
     paidUsers: users.paid || 0,
-    newToday: one("SELECT COUNT(*) AS n FROM users WHERE created_at >= date('now')").n,
-    pending: one("SELECT COUNT(*) AS n FROM payments WHERE status = 'pending'").n,
+    newToday: newToday.n,
+    pending: pending.n,
     sales: money.n,
     revenue: money.total,
     revenueMonth: month.total,
-    questions: questionCount(),
-    exams: one('SELECT COUNT(*) AS n, COALESCE(SUM(passed), 0) AS passed FROM exams'),
-    examsToday: one("SELECT COUNT(*) AS n FROM exams WHERE created_at >= date('now')").n,
-    reviews: one("SELECT COUNT(*) AS n, COALESCE(AVG(rating), 0) AS avg FROM reviews WHERE status = 'published'"),
+    questions,
+    exams,
+    examsToday: examsToday.n,
+    reviews,
     days,
-    log: db.prepare('SELECT admin, action, detail, at FROM admin_log ORDER BY id DESC LIMIT 15').all()
+    log
   };
 });
 
-route('GET', '/api/admin/payments', (ctx) => {
-  requireAdmin(ctx);
+route('GET', '/api/admin/payments', async (ctx) => {
+  await requireAdmin(ctx);
   const status = ctx.url.searchParams.get('status') || 'pending';
   const { limit, offset } = limitOffset(ctx.url);
   const where = ['pending', 'approved', 'rejected'].includes(status) ? 'WHERE p.status = ?' : '';
   const args = where ? [status, limit, offset] : [limit, offset];
-  return db.prepare(`SELECT p.id, p.txid, p.payer, p.amount, p.status, p.note, p.created_at, p.decided_at,
+  const rows = await db.all(`SELECT p.id, p.txid, p.payer, p.amount, p.status, p.note, p.created_at, p.decided_at,
       u.id AS user_id, u.name, u.phone
     FROM payments p JOIN users u ON u.id = p.user_id ${where}
-    ORDER BY p.id ${status === 'pending' ? 'ASC' : 'DESC'} LIMIT ? OFFSET ?`).all(...args)
-    .map((p) => Object.assign(p, { phone: '0' + p.phone, payer: p.payer ? '0' + p.payer : null }));
+    ORDER BY p.id ${status === 'pending' ? 'ASC' : 'DESC'} LIMIT ? OFFSET ?`, ...args);
+  return rows.map((p) => Object.assign(p, { phone: '0' + p.phone, payer: p.payer ? '0' + p.payer : null }));
 });
 
 route('POST', '/api/admin/payments/:id/approve', async (ctx) => {
   await readJson(ctx.req);
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const pid = id(ctx.params.id);
-  const p = tx(() => {
-    const row = db.prepare('SELECT * FROM payments WHERE id = ?').get(pid);
+  const p = await tx(async (t) => {
+    const row = await t.get('SELECT * FROM payments WHERE id = ? FOR UPDATE', pid);
     if (!row) throw new HttpError(404, 'not_found', 'Payment not found.');
     if (row.status !== 'pending') throw new HttpError(409, 'decided', 'This payment was already handled.');
-    db.prepare("UPDATE payments SET status = 'approved', decided_at = datetime('now') WHERE id = ?").run(pid);
-    db.prepare("UPDATE users SET paid = 1, paid_at = COALESCE(paid_at, datetime('now')) WHERE id = ?").run(row.user_id);
-    logAdmin(a.username, 'approve_payment', `#${pid} ${row.txid}`);
+    await t.run(`UPDATE payments SET status = 'approved', decided_at = ${NOW} WHERE id = ?`, pid);
+    await t.run(`UPDATE users SET paid = 1, paid_at = COALESCE(paid_at, ${NOW}) WHERE id = ?`, row.user_id);
+    await logAdmin(a.username, 'approve_payment', `#${pid} ${row.txid}`, t);
     return row;
   });
   live.toUser(p.user_id, 'account', { paid: true });
@@ -508,35 +538,36 @@ route('POST', '/api/admin/payments/:id/approve', async (ctx) => {
 
 route('POST', '/api/admin/payments/:id/reject', async (ctx) => {
   const b = await readJson(ctx.req);
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const pid = id(ctx.params.id);
   const note = String(b.note || '').trim().slice(0, 200) || null;
-  const r = db.prepare("UPDATE payments SET status = 'rejected', note = ?, decided_at = datetime('now') WHERE id = ? AND status = 'pending'").run(note, pid);
+  const r = await db.run(`UPDATE payments SET status = 'rejected', note = ?, decided_at = ${NOW}
+    WHERE id = ? AND status = 'pending' RETURNING user_id`, note, pid);
   if (!r.changes) throw new HttpError(409, 'decided', 'This payment was already handled.');
-  logAdmin(a.username, 'reject_payment', `#${pid} ${note || ''}`);
-  live.toUser(db.prepare('SELECT user_id FROM payments WHERE id = ?').get(pid).user_id, 'account', { rejected: true });
+  await logAdmin(a.username, 'reject_payment', `#${pid} ${note || ''}`);
+  live.toUser(r.rows[0].user_id, 'account', { rejected: true });
   live.toAdmins('stats');
 });
 
-route('GET', '/api/admin/users', (ctx) => {
-  requireAdmin(ctx);
+route('GET', '/api/admin/users', async (ctx) => {
+  await requireAdmin(ctx);
   const { limit, offset } = limitOffset(ctx.url);
   const q = String(ctx.url.searchParams.get('q') || '').trim();
   const filter = ctx.url.searchParams.get('filter');
   const where = [], args = [];
   if (q) {
     const digits = q.replace(/\D/g, '').replace(/^(250|0)/, '');
-    where.push('(name LIKE ?' + (digits ? ' OR phone LIKE ?' : '') + ')');
-    args.push('%' + q + '%');
+    where.push('(name ILIKE ?' + (digits ? ' OR phone LIKE ?' : '') + ')');
+    args.push('%' + q.replace(/[\\%_]/g, '\\$&') + '%');
     if (digits) args.push('%' + digits + '%');
   }
   if (filter === 'paid') where.push('paid = 1');
   if (filter === 'unpaid') where.push('paid = 0');
   if (filter === 'blocked') where.push('blocked = 1');
   const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM users ${w}`).get(...args).n;
-  const rows = db.prepare(`SELECT id, name, phone, paid, paid_at, blocked, trial_done, created_at, last_seen FROM users ${w}
-    ORDER BY id DESC LIMIT ? OFFSET ?`).all(...args, limit, offset);
+  const total = (await db.get(`SELECT COUNT(*) AS n FROM users ${w}`, ...args)).n;
+  const rows = await db.all(`SELECT id, name, phone, paid, paid_at, blocked, trial_done, created_at, last_seen FROM users ${w}
+    ORDER BY id DESC LIMIT ? OFFSET ?`, ...args, limit, offset);
   return {
     total,
     users: rows.map((u) => Object.assign(u, { phone: '0' + u.phone, paid: !!u.paid, blocked: !!u.blocked, trialDone: !!u.trial_done }))
@@ -545,129 +576,152 @@ route('GET', '/api/admin/users', (ctx) => {
 
 route('POST', '/api/admin/users/:id', async (ctx) => {
   const b = await readJson(ctx.req);
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const uid = id(ctx.params.id);
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const u = await db.get('SELECT * FROM users WHERE id = ?', uid);
   if (!u) throw new HttpError(404, 'not_found', 'User not found.');
   if (b.resetTrial === true) {
-    db.prepare('UPDATE users SET trial_done = 0 WHERE id = ?').run(uid);
-    logAdmin(a.username, 'reset_trial', `user ${uid} 0${u.phone}`);
+    await db.run('UPDATE users SET trial_done = 0 WHERE id = ?', uid);
+    await logAdmin(a.username, 'reset_trial', `user ${uid} 0${u.phone}`);
   }
   // Phone numbers are unique; learners ask support to change theirs.
   if (b.phone != null) {
     const phone = normPhone(b.phone);
     if (!phone) throw new HttpError(400, 'bad_phone', 'Enter a valid Rwandan phone number (07...).');
-    const other = db.prepare('SELECT id FROM users WHERE phone = ? AND id <> ?').get(phone, uid);
-    if (other) throw new HttpError(409, 'phone_taken', 'Another account already uses this number.');
-    db.prepare('UPDATE users SET phone = ?, token_version = token_version + 1 WHERE id = ?').run(phone, uid);
-    logAdmin(a.username, 'change_phone', `user ${uid}: 0${u.phone} -> 0${phone}`);
+    const taken = () => new HttpError(409, 'phone_taken', 'Another account already uses this number.');
+    if (await db.get('SELECT id FROM users WHERE phone = ? AND id <> ?', phone, uid)) throw taken();
+    try {
+      await db.run('UPDATE users SET phone = ?, token_version = token_version + 1 WHERE id = ?', phone, uid);
+    } catch (e) {
+      if (isUniqueError(e)) throw taken();
+      throw e;
+    }
+    await logAdmin(a.username, 'change_phone', `user ${uid}: 0${u.phone} -> 0${phone}`);
   }
   if (typeof b.paid === 'boolean') {
-    db.prepare("UPDATE users SET paid = ?, paid_at = CASE WHEN ? THEN COALESCE(paid_at, datetime('now')) ELSE paid_at END WHERE id = ?").run(b.paid ? 1 : 0, b.paid ? 1 : 0, uid);
-    logAdmin(a.username, b.paid ? 'grant_access' : 'remove_access', `user ${uid} 0${u.phone}`);
+    await db.run(b.paid
+      ? `UPDATE users SET paid = 1, paid_at = COALESCE(paid_at, ${NOW}) WHERE id = ?`
+      : 'UPDATE users SET paid = 0 WHERE id = ?', uid);
+    await logAdmin(a.username, b.paid ? 'grant_access' : 'remove_access', `user ${uid} 0${u.phone}`);
   }
   if (typeof b.blocked === 'boolean') {
-    db.prepare('UPDATE users SET blocked = ?, token_version = token_version + 1 WHERE id = ?').run(b.blocked ? 1 : 0, uid);
-    logAdmin(a.username, b.blocked ? 'block_user' : 'unblock_user', `user ${uid} 0${u.phone}`);
+    await db.run('UPDATE users SET blocked = ?, token_version = token_version + 1 WHERE id = ?', b.blocked ? 1 : 0, uid);
+    await logAdmin(a.username, b.blocked ? 'block_user' : 'unblock_user', `user ${uid} 0${u.phone}`);
   }
   if (b.pin != null) {
     const pin = String(b.pin);
     if (!/^\d{4,6}$/.test(pin)) throw new HttpError(400, 'bad_pin', 'The PIN must be 4 to 6 digits.');
-    db.prepare('UPDATE users SET pin_hash = ?, token_version = token_version + 1 WHERE id = ?').run(await hashSecret(pin), uid);
+    await db.run('UPDATE users SET pin_hash = ?, token_version = token_version + 1 WHERE id = ?', await hashSecret(pin), uid);
     loginByPhone.clear(u.phone);
-    logAdmin(a.username, 'reset_pin', `user ${uid} 0${u.phone}`);
+    await logAdmin(a.username, 'reset_pin', `user ${uid} 0${u.phone}`);
   }
   live.toUser(uid, 'account', {});
 });
 
 // ---------- admin: live events & reviews ----------
-route('GET', '/api/admin/events', (ctx) => {
-  requireAdmin(ctx);
+route('GET', '/api/admin/events', async (ctx) => {
+  await requireAdmin(ctx);
   live.subscribeAdmin(ctx.res);
   return STREAM;
 });
 
-route('GET', '/api/admin/reviews', (ctx) => {
-  requireAdmin(ctx);
+route('GET', '/api/admin/reviews', async (ctx) => {
+  await requireAdmin(ctx);
   const status = ctx.url.searchParams.get('status');
   const { limit, offset } = limitOffset(ctx.url);
   const where = status === 'published' || status === 'hidden' ? 'WHERE r.status = ?' : '';
   const args = where ? [status, limit, offset] : [limit, offset];
-  const rows = db.prepare(`SELECT r.id, r.rating, r.comment, r.status, r.created_at, r.updated_at, u.name, u.phone, u.paid
-    FROM reviews r JOIN users u ON u.id = r.user_id ${where} ORDER BY r.updated_at DESC LIMIT ? OFFSET ?`).all(...args);
+  const [rows, summary, hidden] = await Promise.all([
+    db.all(`SELECT r.id, r.rating, r.comment, r.status, r.created_at, r.updated_at, u.name, u.phone, u.paid
+      FROM reviews r JOIN users u ON u.id = r.user_id ${where} ORDER BY r.updated_at DESC LIMIT ? OFFSET ?`, ...args),
+    reviewSummary(),
+    db.get("SELECT COUNT(*) AS n FROM reviews WHERE status = 'hidden'")
+  ]);
   return {
-    summary: reviewSummary(),
-    hidden: db.prepare("SELECT COUNT(*) AS n FROM reviews WHERE status = 'hidden'").get().n,
+    summary,
+    hidden: hidden.n,
     reviews: rows.map((r) => Object.assign(r, { phone: '0' + r.phone, paid: !!r.paid }))
   };
 });
 
 route('POST', '/api/admin/reviews/:id', async (ctx) => {
   const b = await readJson(ctx.req);
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const rid = id(ctx.params.id);
   if (b.status !== 'published' && b.status !== 'hidden') throw new HttpError(400, 'bad_status', 'Choose published or hidden.');
-  const r = db.prepare('UPDATE reviews SET status = ? WHERE id = ?').run(b.status, rid);
+  const r = await db.run('UPDATE reviews SET status = ? WHERE id = ?', b.status, rid);
   if (!r.changes) throw new HttpError(404, 'not_found', 'Review not found.');
-  logAdmin(a.username, b.status === 'hidden' ? 'hide_review' : 'show_review', `#${rid}`);
+  await logAdmin(a.username, b.status === 'hidden' ? 'hide_review' : 'show_review', `#${rid}`);
 });
 
-route('GET', '/api/admin/settings', (ctx) => { requireAdmin(ctx); return getSettings(); });
+route('GET', '/api/admin/settings', async (ctx) => { await requireAdmin(ctx); return getSettings(); });
 
 route('PUT', '/api/admin/settings', async (ctx) => {
   const b = await readJson(ctx.req);
-  const a = requireAdmin(ctx);
-  const err = updateSettings(b);
+  const a = await requireAdmin(ctx);
+  const err = await updateSettings(b);
   if (err) throw new HttpError(400, 'bad_settings', err);
-  logAdmin(a.username, 'settings', Object.keys(b).join(', '));
+  await logAdmin(a.username, 'settings', Object.keys(b).join(', '));
   return getSettings();
 });
 
 // ---------- questions ----------
-route('GET', '/api/admin/questions', (ctx) => {
-  requireAdmin(ctx);
-  const freeIds = new Set(freeQuestionList(getSettings().free_count).map((q) => q.id));
-  return listQuestions(null).map((q) => Object.assign(q, { free: freeIds.has(q.id) }));
+route('GET', '/api/admin/questions', async (ctx) => {
+  await requireAdmin(ctx);
+  const freeIds = new Set((await freeQuestionList((await getSettings()).free_count)).map((q) => q.id));
+  return (await listQuestions(null)).map((q) => Object.assign(q, { free: freeIds.has(q.id) }));
 });
 
-function insertQuestions(list, startOrd) {
-  const ins = db.prepare('INSERT INTO questions(ord, category, image, data) VALUES(?, ?, ?, ?)');
-  list.forEach((q, i) => ins.run(startOrd + i, q.category, q.image, saveQuestionData(q)));
+// Many rows per statement, so a big import is a few round trips to the database, not thousands.
+async function insertQuestions(t, list, startOrd) {
+  const CHUNK = 200;
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const part = list.slice(i, i + CHUNK);
+    const args = [];
+    const values = part.map((q, j) => {
+      args.push(startOrd + i + j, q.category, q.image, saveQuestionData(q));
+      return '(?, ?, ?, ?)';
+    });
+    await t.run(`INSERT INTO questions(ord, category, image, data) VALUES ${values.join(', ')}`, ...args);
+  }
 }
 
-function nextOrd() {
-  return (db.prepare('SELECT MAX(ord) AS m FROM questions').get().m || 0) + 1;
+async function nextOrd(t = db) {
+  return ((await t.get('SELECT MAX(ord) AS m FROM questions')).m || 0) + 1;
 }
 
 route('POST', '/api/admin/questions', async (ctx) => {
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const b = await readJson(ctx.req, 4 * 1024 * 1024);
   const q = validateQuestion(b);
-  const ord = nextOrd();
-  const r = db.prepare('INSERT INTO questions(ord, category, image, data) VALUES(?, ?, ?, ?)').run(ord, q.category, q.image, saveQuestionData(q));
-  logAdmin(a.username, 'add_question', `#${r.lastInsertRowid}`);
-  return rowToQuestion(db.prepare('SELECT * FROM questions WHERE id = ?').get(r.lastInsertRowid));
+  const row = await tx(async (t) => {
+    await t.exec('LOCK TABLE questions IN SHARE ROW EXCLUSIVE MODE');
+    return (await t.run('INSERT INTO questions(ord, category, image, data) VALUES(?, ?, ?, ?) RETURNING *',
+      await nextOrd(t), q.category, q.image, saveQuestionData(q))).rows[0];
+  });
+  await logAdmin(a.username, 'add_question', `#${row.id}`);
+  return rowToQuestion(row);
 });
 
 route('PUT', '/api/admin/questions/:id', async (ctx) => {
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const b = await readJson(ctx.req, 4 * 1024 * 1024);
   const qid = id(ctx.params.id);
   const q = validateQuestion(b);
-  const r = db.prepare("UPDATE questions SET category = ?, image = ?, data = ?, updated_at = datetime('now') WHERE id = ?")
-    .run(q.category, q.image, saveQuestionData(q), qid);
+  const r = await db.run(`UPDATE questions SET category = ?, image = ?, data = ?, updated_at = ${NOW} WHERE id = ? RETURNING *`,
+    q.category, q.image, saveQuestionData(q), qid);
   if (!r.changes) throw new HttpError(404, 'not_found', 'Question not found.');
-  logAdmin(a.username, 'edit_question', `#${qid}`);
-  return rowToQuestion(db.prepare('SELECT * FROM questions WHERE id = ?').get(qid));
+  await logAdmin(a.username, 'edit_question', `#${qid}`);
+  return rowToQuestion(r.rows[0]);
 });
 
 route('DELETE', '/api/admin/questions/:id', async (ctx) => {
   await readJson(ctx.req);
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const qid = id(ctx.params.id);
-  const r = db.prepare('DELETE FROM questions WHERE id = ?').run(qid);
+  const r = await db.run('DELETE FROM questions WHERE id = ?', qid);
   if (!r.changes) throw new HttpError(404, 'not_found', 'Question not found.');
-  logAdmin(a.username, 'delete_question', `#${qid}`);
+  await logAdmin(a.username, 'delete_question', `#${qid}`);
 });
 
 // ---------- import ----------
@@ -677,19 +731,19 @@ function langOf(v) {
 }
 
 route('POST', '/api/admin/import/parse', async (ctx) => {
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const b = await readJson(ctx.req, IMPORT_LIMIT);
   const lang = langOf(b.lang);
   let src;
   if (b.url) src = await fetchSource(String(b.url));
   else src = { content: b.content, filename: String(b.filename || ''), baseUrl: null };
   const candidates = parseSource({ content: src.content, filename: src.filename, lang, baseUrl: src.baseUrl });
-  logAdmin(a.username, 'import_read', b.url ? String(b.url).slice(0, 200) : src.filename);
+  await logAdmin(a.username, 'import_read', b.url ? String(b.url).slice(0, 200) : src.filename);
   return { candidates };
 });
 
 route('POST', '/api/admin/import/commit', async (ctx) => {
-  const a = requireAdmin(ctx);
+  const a = await requireAdmin(ctx);
   const b = await readJson(ctx.req, IMPORT_LIMIT);
   const lang = langOf(b.lang);
   if (!Array.isArray(b.questions) || !b.questions.length) throw new HttpError(400, 'empty', 'Nothing to import.');
@@ -699,51 +753,55 @@ route('POST', '/api/admin/import/commit', async (ctx) => {
   });
 
   if (b.mode === 'replace') {
-    tx(() => {
-      db.exec('DELETE FROM questions');
-      insertQuestions(list, 1);
+    await tx(async (t) => {
+      await t.exec('DELETE FROM questions');
+      await insertQuestions(t, list, 1);
     });
-    logAdmin(a.username, 'import_replace', `${list.length} questions`);
+    await logAdmin(a.username, 'import_replace', `${list.length} questions`);
     return { added: list.length, updated: 0, skipped: 0 };
   }
 
   if (b.mode === 'append') {
-    tx(() => insertQuestions(list, nextOrd()));
-    logAdmin(a.username, 'import_append', `${list.length} questions`);
+    await tx(async (t) => {
+      await t.exec('LOCK TABLE questions IN SHARE ROW EXCLUSIVE MODE');
+      await insertQuestions(t, list, await nextOrd(t));
+    });
+    await logAdmin(a.username, 'import_append', `${list.length} questions`);
     return { added: list.length, updated: 0, skipped: 0 };
   }
 
   if (b.mode === 'translate') {
     // Adds this language to the existing questions, matched by position.
-    const existing = db.prepare('SELECT * FROM questions ORDER BY ord, id').all();
-    const upd = db.prepare("UPDATE questions SET data = ?, updated_at = datetime('now') WHERE id = ?");
-    let updated = 0, skipped = 0;
-    tx(() => {
-      existing.forEach((row, i) => {
+    let updated = 0, skipped = 0, existingCount = 0;
+    await tx(async (t) => {
+      const existing = await t.all('SELECT * FROM questions ORDER BY ord, id FOR UPDATE');
+      existingCount = existing.length;
+      for (let i = 0; i < existing.length; i++) {
+        const row = existing[i];
         const incoming = list[i];
-        if (!incoming || !incoming.text[lang]) { skipped++; return; }
+        if (!incoming || !incoming.text[lang]) { skipped++; continue; }
         const cur = rowToQuestion(row);
         const count = Object.values(cur.options)[0].length;
-        if (incoming.options[lang].length !== count || incoming.answer !== cur.answer) { skipped++; return; }
+        if (incoming.options[lang].length !== count || incoming.answer !== cur.answer) { skipped++; continue; }
         cur.text[lang] = incoming.text[lang];
         cur.options[lang] = incoming.options[lang];
         if (incoming.explanation[lang]) cur.explanation[lang] = incoming.explanation[lang];
-        upd.run(saveQuestionData(cur), row.id);
+        await t.run(`UPDATE questions SET data = ?, updated_at = ${NOW} WHERE id = ?`, saveQuestionData(cur), row.id);
         updated++;
-      });
+      }
     });
-    skipped += Math.max(0, list.length - existing.length);
-    logAdmin(a.username, 'import_translation', `${lang}: ${updated} updated, ${skipped} skipped`);
+    skipped += Math.max(0, list.length - existingCount);
+    await logAdmin(a.username, 'import_translation', `${lang}: ${updated} updated, ${skipped} skipped`);
     return { added: 0, updated, skipped };
   }
 
   throw new HttpError(400, 'bad_mode', 'Choose how to import.');
 });
 
-route('GET', '/api/admin/log', (ctx) => {
-  requireAdmin(ctx);
+route('GET', '/api/admin/log', async (ctx) => {
+  await requireAdmin(ctx);
   const { limit, offset } = limitOffset(ctx.url);
-  return db.prepare('SELECT admin, action, detail, at FROM admin_log ORDER BY id DESC LIMIT ? OFFSET ?').all(limit, offset);
+  return db.all('SELECT admin, action, detail, at FROM admin_log ORDER BY id DESC LIMIT ? OFFSET ?', limit, offset);
 });
 
 module.exports = { handle };

@@ -4,7 +4,7 @@ Driving-theory practice app for Rwanda's provisional licence exam. Learners prac
 
 - Learner app: `/`. Installable on phones and works offline after the first visit. Kinyarwanda, English and French.
 - Admin panel: `/admin`. Payments, learners, questions, import and settings.
-- No dependencies. Needs Node.js 22.13 or newer.
+- Needs Node.js 22.13 or newer. One package: `pg` (Postgres).
 
 ## Run it on your computer
 
@@ -38,32 +38,27 @@ When a learner pays, they enter the MoMo Transaction ID. It shows up under **Pay
 - Imports never run the uploaded file. Import links can't reach private or local addresses.
 - Every admin action is logged (Dashboard → Recent admin activity).
 
-Keep `data/` private and backed up. It holds the database and `secret.key`.
+Keep `data/` private. On your computer it holds the local database and `secret.key`. Online, the data is in Supabase, which backs it up daily.
 
 ## Put it online
 
-The host needs a **persistent disk**, because the database is a file in `data/`. Set these environment variables:
+Free, with no bank card: the app runs on **Render** and the data lives in **Supabase** (Postgres).
+On your own computer, with no `DATABASE_URL`, the app uses a built-in Postgres (PGlite) in `data/pg` instead.
+
+1. **Supabase:** open the project, click **Connect**, and copy the **Session pooler** connection string. Put your database password in it (Project Settings → Database → Reset database password if you don't have it).
+2. **Render:** New → **Blueprint** → choose this GitHub repository. It reads `render.yaml`. Paste the connection string as `DATABASE_URL`.
+
+The tables are created on first start, in their own `prov` schema that Supabase's public API can't reach.
 
 | Variable | Value |
 |---|---|
+| `DATABASE_URL` | Supabase Session pooler string |
 | `NODE_ENV` | `production` (secure cookies + HSTS; site must be on HTTPS) |
-| `TRUST_PROXY` | `1` when behind the host's proxy/HTTPS (most hosts) |
-| `DATA_DIR` | path on the persistent disk |
-| `SESSION_SECRET` | 32+ random characters |
-| `ADMIN_USER`, `ADMIN_PASSWORD` | creates the first admin on first start. Remove them afterwards. |
+| `TRUST_PROXY` | `1` behind the host's proxy (Render) |
+| `SESSION_SECRET` | 32+ random characters (Render generates it) |
+| `ADMIN_USER`, `ADMIN_PASSWORD` | only for a brand-new database: creates the first admin on first start. Remove them afterwards. |
 
-Start command: `npm start`.
-
-### On your own Ubuntu server (e.g. Oracle Cloud Always Free)
-
-From Git Bash on your PC, with the server's IP and a domain pointing at it:
-
-```
-bash deploy/deploy.sh <server-ip> <domain> --with-data   # first time: also copies data/
-bash deploy/deploy.sh <server-ip> <domain>               # later updates (commit first)
-```
-
-It installs Node and Caddy (free automatic HTTPS), runs the app as a service that restarts itself, and backs the database up daily to `/var/lib/prov-app/backups`. Later updates never overwrite the data on the server.
+Render's free plan sleeps after 15 minutes without visitors, and the next visit waits about a minute. A free monitor (e.g. UptimeRobot) that opens `/api/config` every 10 minutes keeps it awake. That also keeps Supabase from pausing the project after a week without use.
 
 ## Tests
 

@@ -2,7 +2,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { db } = require('./src/db');
+const { db, init, close } = require('./src/db');
 const { hashSecret } = require('./src/auth');
 const { handle } = require('./src/api');
 const { sendJson } = require('./src/http');
@@ -94,19 +94,31 @@ const server = http.createServer(async (req, res) => {
 
 // First run on a host: create the admin from environment variables.
 async function seedAdmin() {
-  const count = db.prepare('SELECT COUNT(*) AS n FROM admins').get().n;
+  const count = (await db.get('SELECT COUNT(*) AS n FROM admins')).n;
   if (count) return;
   const user = process.env.ADMIN_USER, pass = process.env.ADMIN_PASSWORD;
   if (user && pass && pass.length >= 10) {
-    db.prepare('INSERT INTO admins(username, pass_hash) VALUES(?, ?)').run(user, await hashSecret(pass));
+    await db.run('INSERT INTO admins(username, pass_hash) VALUES(?, ?)', user, await hashSecret(pass));
     console.log(`Admin "${user}" created from ADMIN_USER / ADMIN_PASSWORD.`);
   } else {
     console.log('No admin account yet. Create one with:  npm run create-admin -- <username>');
   }
 }
 
-seedAdmin().then(() => {
+init().then(seedAdmin).then(() => {
   server.listen(PORT, () => {
     console.log(`Provisoire Yanjye running: http://localhost:${PORT}   admin: http://localhost:${PORT}/admin`);
   });
+}).catch((e) => {
+  console.error('Could not open the database:', e.message);
+  process.exit(1);
 });
+
+// Hosts stop the app with SIGTERM when they redeploy; close the database cleanly.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    server.close();
+    Promise.resolve(close()).finally(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  });
+}
