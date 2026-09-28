@@ -753,7 +753,11 @@ route('POST', '/api/admin/import/parse', async (ctx) => {
     throw e;
   }
   await logAdmin(a.username, 'import_read', what);
-  return { candidates };
+  // How many current questions already have text in this language, so the page can suggest
+  // "Add as a translation" instead of "Replace" when a new language comes in.
+  const existing = await db.get(`SELECT COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE (data::jsonb -> 'text' ->> ?) <> '') AS "inLang" FROM questions`, lang);
+  return { candidates, existing };
 });
 
 route('POST', '/api/admin/import/commit', async (ctx) => {

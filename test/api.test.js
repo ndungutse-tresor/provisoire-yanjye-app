@@ -132,6 +132,12 @@ test('import: CSV with letter answers and a translation merge', async () => {
   const c = r.body.candidates[0];
   assert.equal(c.questions.length, 60);
   assert.equal(c.questions[0].text.en, 'Question 0, in English');
+  // The page is told the file is English and that no current question has English yet.
+  assert.equal(c.language, 'en');
+  assert.deepEqual(r.body.existing, { total: 60, inLang: 0 });
+  const wrong = await admin('POST', '/api/admin/import/parse', { lang: 'rw', filename: 'q.csv', content: rows.join('\r\n') });
+  assert.equal(wrong.body.candidates[0].language, 'en');
+  assert.equal(wrong.body.existing.inLang, 60);
   const m = await admin('POST', '/api/admin/import/commit', { lang: 'en', mode: 'translate', questions: c.questions });
   assert.equal(m.body.updated, 60);
   const all = await admin('GET', '/api/admin/questions');

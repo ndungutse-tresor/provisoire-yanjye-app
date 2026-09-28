@@ -365,7 +365,31 @@ function buildCandidate(group, lang, baseUrl, images) {
   if (httpImages) warnings.push(`${httpImages} image(s) use http:// links, which phones may block. Use https:// links.`);
 
   const pictures = questions.filter((q) => q.image).length;
-  return { path: group.path, found: objs.length, pictures, mapping: describe(map, oneBased), warnings, questions };
+  const language = detectLanguage(questions, lang);
+  return { path: group.path, found: objs.length, pictures, language, mapping: describe(map, oneBased), warnings, questions };
+}
+
+// Guesses which language the questions are written in, from common words, so the admin
+// can't store an English file as Kinyarwanda by mistake. Returns null when unsure.
+const COMMON_WORDS = {
+  rw: ['ni', 'na', 'iki', 'ku', 'mu', 'cy', 'bw', 'by', 'nta', 'cyangwa', 'iyo', 'kandi', 'umuhanda', 'ikinyabiziga',
+    'ibinyabiziga', 'umuyobozi', 'gisubizo', 'ibisubizo', 'ukuri', 'kirimo', 'bikurikira', 'gisobanura', 'cyapa'],
+  en: ['the', 'of', 'and', 'to', 'is', 'in', 'on', 'what', 'which', 'when', 'must', 'are', 'you', 'vehicle', 'vehicles',
+    'driver', 'road', 'none', 'answers', 'correct', 'sign', 'this'],
+  fr: ['le', 'la', 'les', 'des', 'du', 'de', 'est', 'un', 'une', 'et', 'que', 'qui', 'vous', 'doit', 'lorsque',
+    'véhicule', 'véhicules', 'conducteur', 'route', 'aucune', 'réponse', 'sont', 'panneau', 'ce']
+};
+function detectLanguage(questions, lang) {
+  const score = { rw: 0, en: 0, fr: 0 };
+  const sets = Object.fromEntries(Object.entries(COMMON_WORDS).map(([l, w]) => [l, new Set(w)]));
+  for (const q of questions.slice(0, 200)) {
+    const text = [q.text[lang] || '', ...(q.options[lang] || [])].join(' ').toLowerCase();
+    for (const word of text.split(/[^a-zà-ÿ]+/)) {   // apostrophes split too: cy’ukuri, n'est
+      for (const l of Object.keys(sets)) if (sets[l].has(word)) score[l]++;
+    }
+  }
+  const [best, second] = Object.entries(score).sort((a, b) => b[1] - a[1]);
+  return best[1] >= 10 && best[1] >= second[1] * 2 ? best[0] : null;
 }
 
 function parseSource({ content, filename, files, lang, baseUrl }) {

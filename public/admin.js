@@ -485,6 +485,13 @@
         (c.pictures ? ', <b>' + c.pictures + '</b> with pictures' : '') + '.</p>' +
         '<p class="small muted">Read as: ' + esc(c.mapping) + '</p>';
       c.warnings.forEach(function (w) { h += '<div class="warn">' + esc(w) + '</div>'; });
+      // The file's own language decides where its text is stored, so a wrong choice is blocked.
+      var mismatch = c.language && c.language !== m.lang;
+      if (mismatch) {
+        h += '<div class="warn"><b>This file is in ' + esc(LANG_NAMES[c.language]) + ', but the language chosen above is ' + esc(LANG_NAMES[m.lang]) + '.</b> ' +
+          'Importing it like this would save ' + esc(LANG_NAMES[c.language]) + ' text as ' + esc(LANG_NAMES[m.lang]) + '. ' +
+          '<button class="btn btn-primary btn-sm" data-action="imp-use-lang" data-l="' + esc(c.language) + '">Use ' + esc(LANG_NAMES[c.language]) + '</button></div>';
+      }
       c.questions.slice(0, 5).forEach(function (q, i) {
         var opts = q.options[m.lang];
         h += '<div class="preview-q">' + (q.image ? '<img src="' + esc(q.image) + '" alt="">' : '') +
@@ -499,7 +506,8 @@
         radio('replace', 'Replace all questions', 'Deletes the ' + existing + ' current questions and uses these instead.') +
         radio('append', 'Add to the end', 'Keeps current questions and adds these after them.') +
         radio('translate', 'Add as a translation', 'Adds ' + LANG_NAMES[m.lang] + ' text to the current questions, matched in order (question 1 to question 1…). Use this for the same questions in another language.') +
-        '<button class="btn btn-accent" data-action="imp-commit"' + (m.busy ? ' disabled' : '') + '>' + icon('upload') + 'Import ' + c.questions.length + ' questions</button></div>';
+        (mismatch ? '<p class="help">Fix the language first (step 2).</p>' : '') +
+        '<button class="btn btn-accent" data-action="imp-commit"' + (m.busy || mismatch ? ' disabled' : '') + '>' + icon('upload') + 'Import ' + c.questions.length + ' questions</button></div>';
     }
     shell(h);
   }
@@ -704,6 +712,10 @@
         paintQuestions();
       }).catch(fail);
     },
+    'imp-use-lang': function (el) {
+      A.imp.lang = el.getAttribute('data-l');
+      actions['imp-read']();
+    },
     'imp-source': function (el) { A.imp.source = el.getAttribute('data-s'); A.imp.candidates = null; paintImport(); },
     'imp-read': function () {
       var m = A.imp;
@@ -724,7 +736,9 @@
       api('POST', '/api/admin/import/parse', body).then(function (r) {
         m.candidates = r.candidates;
         m.pick = 0;
-        m.mode = (A.stats && A.stats.questions) ? m.mode : 'replace';
+        // A new language for questions that already exist is a translation, not a replacement.
+        var ex = r.existing || { total: 0, inLang: 0 };
+        m.mode = !ex.total ? 'replace' : !ex.inLang ? 'translate' : m.mode;
       }).catch(function (e) {
         m.candidates = null;
         fail(e);
