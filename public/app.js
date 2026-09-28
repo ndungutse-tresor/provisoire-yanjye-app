@@ -349,7 +349,7 @@
     var pct = avail ? Math.round(Math.min(st.answered, avail) / avail * 100) : 0;
     var okPct = st.answered ? Math.round(st.ok / st.answered * 100) : 0;
     var pos = progress.pos.all || 0;
-    var mist = mistakeIds().length;
+    var mist = S.me ? mistakeIds().length : 0;   // history is personal: only for a logged-in learner
     var cfg = S.config;
     var h = '';
 
@@ -426,7 +426,7 @@
 
     h += reviewsBlock(3);
 
-    if (progress.exams.length) {
+    if (S.me && progress.exams.length) {
       h += '<div class="section-title">' + esc(t('recent_exams')) + '</div><div class="history">';
       progress.exams.slice(0, 5).forEach(function (e) {
         h += '<div class="h"><span>' + esc(e.d) + '</span><b>' + e.s + '/' + e.t + '</b><span class="badge ' + (e.p ? 'badge-ok' : 'badge-free') + '">' +
@@ -1263,6 +1263,14 @@
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function () {}); });
+    // A new version took over while this page was open: reload once so it runs the new code.
+    // (Not on the very first install, when there was no older version.)
+    var hadController = !!navigator.serviceWorker.controller, reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController || reloading || (ex && !ex.result)) return;   // never interrupt a running exam
+      reloading = true;
+      location.reload();
+    });
   }
 
   // ---------- start ----------
