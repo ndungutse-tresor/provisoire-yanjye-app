@@ -13,6 +13,7 @@
     });
   }
   var ICONS = {
+    eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
     dash: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
     money: '<rect x="2.5" y="6" width="19" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 9.5v5M18 9.5v5"/>',
     users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14c2.2.7 3.5 2.9 3.5 6"/>',
@@ -248,14 +249,18 @@
       }).join('');
       var h = '<div class="head"><h1>Payments</h1><div class="tabs">' + tabs + '</div></div>';
       if (A.payStatus === 'pending') {
-        h += '<p class="muted">Match each Transaction ID and amount against your MoMo messages before approving. Approving unlocks the learner immediately.</p>';
+        h += '<p class="muted">Match each Transaction ID, or the picture of the MoMo message, and the amount against your own MoMo messages before approving. Approving unlocks the learner immediately.</p>';
       }
       if (!A.payments.length) {
         h += '<div class="card empty">' + (A.payStatus === 'pending' ? 'No payments waiting. 🎉' : 'Nothing here.') + '</div>';
       }
       A.payments.forEach(function (p) {
         h += '<div class="card pay"><div><div class="who">' + esc(p.name) + ' · ' + esc(p.phone) + '</div>' +
-          '<div class="meta"><span>TxID <button class="tx" data-action="copy" data-text="' + esc(p.txid) + '" title="Copy">' + esc(p.txid) + '</button></span>' +
+          '<div class="meta">' + (p.txid
+            ? '<span>TxID <button class="tx" data-action="copy" data-text="' + esc(p.txid) + '" title="Copy">' + esc(p.txid) + '</button></span>'
+            : '') +
+          (p.proof ? '<span><button class="btn btn-ghost btn-sm" data-action="proof" data-id="' + p.id + '">' + icon('eye') + 'View picture</button></span>' : '') +
+          (p.proof_dupes ? '<span class="badge badge-free">⚠ Same picture as ' + p.proof_dupes + ' other payment' + (p.proof_dupes > 1 ? 's' : '') + '</span>' : '') +
           '<span>' + esc(money(p.amount)) + '</span>' + (p.payer && p.payer !== p.phone ? '<span>Paid from ' + esc(p.payer) + '</span>' : '') +
           '<span>Sent ' + esc(when(p.created_at)) + '</span>' +
           (p.status !== 'pending' ? '<span class="badge ' + (p.status === 'approved' ? 'badge-ok' : 'badge-free') + '">' + p.status + '</span>' : '') +
@@ -641,8 +646,19 @@
       el.disabled = true;
       api('POST', '/api/admin/payments/' + p.id + '/approve', {}).then(function () { toast('Approved: ' + p.name + ' is unlocked.'); showPayments(); }).catch(function (e) { el.disabled = false; fail(e); });
     },
+    proof: function (el) {
+      // The picture comes from the server, for admins only (the admin cookie is sent with it).
+      modal.innerHTML = '<div class="modal-box" role="dialog" aria-modal="true"><div class="modal-head"><h2>Payment picture</h2>' +
+        '<button class="btn btn-ghost btn-sm" data-action="close-modal">' + icon('x') + 'Close</button></div>' +
+        '<p class="muted small">Check the amount, the date and the Transaction ID in the picture against your own MoMo messages.</p>' +
+        '<img class="proof-img" src="/api/admin/payments/' + encodeURIComponent(el.getAttribute('data-id')) + '/proof" alt="Payment picture"></div>';
+      modal.hidden = false;
+    },
     reject: function (el) {
-      var note = prompt('Reason (the learner sees this):', 'We could not find this Transaction ID. Please check it and send again.');
+      var pay = (A.payments || []).filter(function (x) { return String(x.id) === el.getAttribute('data-id'); })[0];
+      var note = prompt('Reason (the learner sees this):', pay && pay.proof && !pay.txid
+        ? 'We could not confirm this payment from the picture. Please send a clearer picture or the Transaction ID.'
+        : 'We could not find this Transaction ID. Please check it and send again.');
       if (note === null) return;
       api('POST', '/api/admin/payments/' + el.getAttribute('data-id') + '/reject', { note: note }).then(function () { toast('Rejected.'); showPayments(); }).catch(fail);
     },

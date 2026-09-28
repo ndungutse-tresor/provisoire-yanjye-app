@@ -33,6 +33,7 @@
   }
 
   var ICONS = {
+    camera: '<path d="M4 8h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13.5" r="3.5"/>',
     home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/>',
     book: '<path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H19v15H5.5A1.5 1.5 0 0 0 4 19.5z"/><path d="M4 19.5A1.5 1.5 0 0 0 5.5 21H19v-3"/><path d="M8 7h7M8 11h5"/>',
     timer: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/>',
@@ -98,6 +99,7 @@
     progressUid = uid;
     progress = Object.assign(blankProgress(), (uid && store.get('prov.progress.' + uid, null)) || {});
     ex = null;   // an exam in progress belongs to the account that started it
+    payPhoto = null;
   }
 
   var pr = { key: null, list: [], idx: 0, picked: null, done: {} }; // practice session (done: answers given this session)
@@ -106,6 +108,7 @@
   var installPrompt = null;
   var study = { key: null, limit: 20, search: '', lang: store.get('prov.studyLang', null) || lang }; // study (read answers) session
   var rateValue = 0;                                              // stars picked in the review form
+  var payMode = 'txid', payPhoto = null;                          // payment proof: Transaction ID, or a picture of the MoMo message
   var editingReview = false;
   var liveSource = null, liveUid = null;
 
@@ -998,11 +1001,11 @@
     var p = S.payment;
     if (p && p.status === 'pending') {
       return h + '<div class="gap"></div><div class="card state-card"><div class="state-icon bi-blue">' + icon('clock') + '</div>' +
-        '<h2>' + esc(t('pending_title')) + '</h2><p class="muted">' + esc(t('pending_body', { txid: p.txid })) + '</p>' +
+        '<h2>' + esc(t('pending_title')) + '</h2><p class="muted">' + esc(p.proof ? t('pending_body_photo') : t('pending_body', { txid: p.txid })) + '</p>' +
         (window.EventSource ? '<p class="live-note"><span class="live-dot"></span>' + esc(t('live_waiting')) + '</p>' : '') +
         '<button class="btn btn-primary btn-block" data-action="check-payment">' + icon('refresh') + esc(t('check_again')) + '</button>' +
         (cfg.whatsapp ? '<div class="gap"></div><a class="btn btn-wa btn-block" target="_blank" rel="noopener" href="' +
-          esc(waLink(t('wa_msg', { app: cfg.appName }) + ' ' + S.me.phone + ' · ' + t('txid') + ': ' + p.txid)) + '">' + icon('chat') + esc(t('whatsapp_help')) + '</a>' : '') +
+          esc(waLink(t('wa_msg', { app: cfg.appName }) + ' ' + S.me.phone + ' · ' + (p.txid ? t('txid') + ': ' + p.txid : t('pay_by_photo')))) + '">' + icon('chat') + esc(t('whatsapp_help')) + '</a>' : '') +
         '</div>';
     }
 
@@ -1011,15 +1014,28 @@
       h += '<div class="form-error"><b>' + esc(t('rejected_title')) + '.</b> ' + esc(p.note || t('rejected_body')) + '</div>';
     }
     h += '<ol class="steps"><li><div>' + momoCard();
-    h += '</div></li><li><div><div>' + esc(t('pay_step2')) + '</div>' +
+    // Step 2: confirm with the Transaction ID from the SMS, or with a picture of the message.
+    h += '</div></li><li><div><div>' + esc(t('pay_choose')) + '</div>' +
+      '<div class="seg on-surface pay-seg" role="group">' + [['txid', t('pay_by_txid')], ['photo', t('pay_by_photo')]].map(function (m) {
+        return '<button type="button" data-action="pay-mode" data-m="' + m[0] + '" aria-pressed="' + (payMode === m[0]) + '">' + esc(m[1]) + '</button>';
+      }).join('') + '</div>' +
       '<form data-form="pay" novalidate><div class="form-error" hidden></div>' +
-      '<label class="field"><span class="sr">' + esc(t('txid')) + '</span><input class="input" name="txid" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="' + esc(t('txid')) + '" required></label>' +
+      (payMode === 'photo'
+        ? '<p class="small muted">' + esc(t('photo_step')) + '</p>' +
+          '<label class="photo-pick">' + (payPhoto ? '<img src="' + esc(payPhoto) + '" alt="' + esc(t('pay_by_photo')) + '">' : icon('camera')) +
+          '<span class="btn btn-ghost btn-sm">' + esc(t(payPhoto ? 'photo_change' : 'photo_choose')) + '</span>' +
+          '<input type="file" name="photo" accept="image/*" hidden></label>'
+        : '<p class="small muted">' + esc(t('pay_step2')) + '</p>' +
+          '<label class="field"><span class="sr">' + esc(t('txid')) + '</span><input class="input" name="txid" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="' + esc(t('txid')) + '" required></label>') +
       '<label class="check"><input type="checkbox" name="other"> ' + esc(t('paid_other')) + '</label>' +
       '<label class="field" data-payer hidden><span>' + esc(t('payer_phone')) + '</span><input class="input" name="payer" type="tel" inputmode="tel" placeholder="07XX XXX XXX"></label>' +
       '<button class="btn btn-primary btn-block" type="submit">' + esc(t('submit_payment')) + '</button></form></div></li></ol></div>';
     if (cfg.whatsapp) {
-      h += '<div class="gap"></div><a class="btn btn-wa btn-block" target="_blank" rel="noopener" href="' +
-        esc(waLink(t('wa_msg', { app: cfg.appName }) + ' ' + S.me.phone)) + '">' + icon('chat') + esc(t('whatsapp_help')) + '</a>';
+      // Paid, but no MoMo message to show: support confirms it by hand.
+      h += '<div class="gap"></div><div class="card no-message"><h3>' + esc(t('no_message_title')) + '</h3>' +
+        '<p class="small muted">' + esc(t('no_message_body')) + '</p>' +
+        '<a class="btn btn-wa btn-block" target="_blank" rel="noopener" href="' +
+        esc(waLink(t('wa_no_message', { app: cfg.appName }) + ' ' + S.me.phone)) + '">' + icon('chat') + esc(t('no_message_btn')) + '</a></div>';
     }
     return h;
   }
@@ -1094,6 +1110,7 @@
       ex.idx = i; paint(viewExamRun()); window.scrollTo(0, 0);
     },
     'finish-exam': function () { finishExam(false); },
+    'pay-mode': function (el) { payMode = el.getAttribute('data-m'); render(); },
     'auth-mode': function () { authMode = authMode === 'register' ? 'login' : 'register'; render(); },
     logout: function () {
       api('POST', '/api/auth/logout', {}).catch(function () {}).then(reload).then(function () {
@@ -1159,7 +1176,42 @@
       var box = view.querySelector('[data-payer]');
       if (box) box.hidden = !e.target.checked;
     }
+    if (e.target.name === 'photo' && e.target.files && e.target.files[0]) {
+      var form = e.target.form;
+      shrinkPhoto(e.target.files[0]).then(function (url) { payPhoto = url; render(); })
+        .catch(function () { formError(form, t('photo_bad')); });
+    }
   });
+
+  // The picture is redrawn on the phone before sending: at most 1600 px and JPEG, so it is quick
+  // on mobile data, and hidden details such as where the photo was taken are left behind.
+  function shrinkPhoto(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onerror = reject;
+      reader.onload = function () {
+        var img = new Image();
+        img.onerror = reject;
+        img.onload = function () {
+          var w = img.naturalWidth, h = img.naturalHeight;
+          if (!w || !h) return reject(new Error('empty'));
+          var k = Math.min(1, 1600 / Math.max(w, h));
+          var c = document.createElement('canvas');
+          c.width = Math.round(w * k);
+          c.height = Math.round(h * k);
+          var g = c.getContext('2d');
+          g.fillStyle = '#fff';
+          g.fillRect(0, 0, c.width, c.height);
+          g.drawImage(img, 0, 0, c.width, c.height);
+          var q = 0.85, url = c.toDataURL('image/jpeg', q);
+          while (url.length > 2.6e6 && q > 0.4) { q -= 0.15; url = c.toDataURL('image/jpeg', q); }   // stays under the 2 MB limit
+          resolve(url);
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
 
   function formBusy(form, busy) {
     var b = form.querySelector('button[type=submit]');
@@ -1184,9 +1236,15 @@
       return api('POST', '/api/auth/login', { phone: f.phone.value, pin: f.pin.value });
     },
     pay: function (f) {
-      var body = { txid: f.txid.value };
+      var body = {};
+      if (payMode === 'photo') {
+        if (!payPhoto) return formError(f, t('photo_needed'));
+        body.proof = payPhoto;
+      } else {
+        body.txid = f.txid.value;
+      }
       if (f.other.checked && f.payer.value) body.payer = f.payer.value;
-      return api('POST', '/api/payments', body);
+      return api('POST', '/api/payments', body).then(function (r) { payPhoto = null; return r; });
     },
     review: function (f) {
       if (!rateValue) return formError(f, t('rate_pick'));

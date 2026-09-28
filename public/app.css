@@ -508,3 +508,14 @@ img { max-width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Payment proof: Transaction ID or a picture of the MoMo message */
+.pay-seg { display: flex; margin: 10px 0 12px; }
+.pay-seg button { flex: 1; }
+.photo-pick {
+  display: flex; flex-direction: column; align-items: center; gap: 10px; margin-bottom: 14px;
+  padding: 16px; border: 2px dashed var(--line); border-radius: 14px; cursor: pointer; text-align: center;
+}
+.photo-pick svg { width: 34px; height: 34px; opacity: .7; }
+.photo-pick img { max-width: 100%; max-height: 260px; border-radius: 10px; object-fit: contain; }
+.no-message h3 { margin: 0 0 6px; font-size: 17px; }

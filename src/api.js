@@ -1,4 +1,5 @@
 'use strict';
+const crypto = require('node:crypto');
 const {
   db, tx, NOW, ago, TODAY, isUniqueError,
   getSettings, updateSettings, listQuestions, questionCount, rowToQuestion, saveQuestionData, logAdmin
@@ -18,6 +19,7 @@ const ADMIN_COOKIE = 'pa_a';
 const USER_DAYS = 180;
 const ADMIN_HOURS = 12;
 const IMPORT_LIMIT = 32 * 1024 * 1024;
+const PROOF_MAX = 2 * 1024 * 1024;   // a payment picture, after the phone has shrunk it
 
 // ---------- rate limits ----------
 const loginByPhone = new Limiter(5, 15 * 60 * 1000);
@@ -233,7 +235,8 @@ route('GET', '/api/me', async (ctx) => {
   const u = await currentUser(ctx);
   if (!u) return { user: null, payment: null, review: null, examCount: 0 };
   const [p, r, count, lastExam, usage] = await Promise.all([
-    db.get('SELECT id, txid, amount, status, note, created_at FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT 1', u.id),
+    db.get(`SELECT id, txid, amount, status, note, created_at, proof_hash IS NOT NULL AS proof
+      FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT 1`, u.id),
     db.get('SELECT rating, comment, updated_at FROM reviews WHERE user_id = ?', u.id),
     db.get('SELECT COUNT(*) AS n FROM exams WHERE user_id = ?', u.id),
     db.get('SELECT score, total, passed, created_at FROM exams WHERE user_id = ? ORDER BY id DESC LIMIT 1', u.id),
@@ -410,12 +413,31 @@ route('GET', '/api/questions', async (ctx) => {
   return { full: false, total, freeCount, questions: await freeQuestionList(s.free_count) };
 });
 
+// A picture of the MoMo payment message, sent as a data: URL. Only real JPEG, PNG or WebP files
+// are kept (checked by their first bytes, not by what the browser claims); never SVG, which can hold script.
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+function readProof(v) {
+  const m = /^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(String(v || ''));
+  const bad = () => new HttpError(400, 'bad_proof', 'Choose a picture of the MoMo message (JPG or PNG).');
+  if (!m) throw bad();
+  const data = Buffer.from(m[1], 'base64');
+  if (data.length > PROOF_MAX) throw new HttpError(413, 'too_large', 'The picture is too large.');
+  let mime = null;
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) mime = 'image/jpeg';
+  else if (data.subarray(0, 8).equals(PNG_SIGNATURE)) mime = 'image/png';
+  else if (data.subarray(0, 4).toString('latin1') === 'RIFF' && data.subarray(8, 12).toString('latin1') === 'WEBP') mime = 'image/webp';
+  if (!mime || data.length < 1000) throw bad();
+  return { data, mime, hash: crypto.createHash('sha256').update(data).digest('hex') };
+}
+
+// Payment confirmation: the Transaction ID from the MoMo SMS, or a picture of that message.
 route('POST', '/api/payments', async (ctx) => {
-  const b = await readJson(ctx.req);
+  const b = await readJson(ctx.req, Math.ceil(PROOF_MAX * 1.4) + 10 * 1024);
   const u = await requireUser(ctx);
   if (u.paid) throw new HttpError(400, 'already_paid', 'Your account is already unlocked.');
-  const txid = String(b.txid || '').replace(/\s+/g, '').toUpperCase();
-  if (!/^[A-Z0-9.\-]{6,40}$/.test(txid)) throw new HttpError(400, 'bad_txid', 'Enter the transaction ID from your MoMo SMS.');
+  const proof = b.proof ? readProof(b.proof) : null;
+  const txid = proof ? null : String(b.txid || '').replace(/\s+/g, '').toUpperCase();
+  if (!proof && !/^[A-Z0-9.\-]{6,40}$/.test(txid)) throw new HttpError(400, 'bad_txid', 'Enter the transaction ID from your MoMo SMS.');
   const payer = b.payer ? normPhone(b.payer) : u.phone;
   if (b.payer && !payer) throw new HttpError(400, 'bad_phone', 'The number that paid is not valid.');
   if (payByUser.blocked(u.id)) throw tooMany(payByUser, u.id);
@@ -426,10 +448,12 @@ route('POST', '/api/payments', async (ctx) => {
     if (await t.get("SELECT 1 FROM payments WHERE user_id = ? AND status = 'pending'", u.id)) {
       throw new HttpError(409, 'pending_exists', 'Your payment is already waiting for confirmation.');
     }
-    if (await t.get('SELECT 1 FROM payments WHERE txid = ?', txid)) {
+    if (txid && await t.get('SELECT 1 FROM payments WHERE txid = ?', txid)) {
       throw new HttpError(409, 'txid_used', 'This transaction ID was already used.');
     }
-    await t.run('INSERT INTO payments(user_id, txid, payer, amount) VALUES(?, ?, ?, ?)', u.id, txid, payer, price);
+    const row = (await t.run('INSERT INTO payments(user_id, txid, payer, amount, proof_hash) VALUES(?, ?, ?, ?, ?) RETURNING id',
+      u.id, txid, payer, price, proof ? proof.hash : null)).rows[0];
+    if (proof) await t.run('INSERT INTO payment_proofs(payment_id, mime, data) VALUES(?, ?, ?)', row.id, proof.mime, proof.data);
   }).catch((e) => {
     if (isUniqueError(e)) throw new HttpError(409, 'txid_used', 'This transaction ID was already used.');
     throw e;
@@ -512,8 +536,11 @@ route('GET', '/api/admin/payments', async (ctx) => {
   const { limit, offset } = limitOffset(ctx.url);
   const where = ['pending', 'approved', 'rejected'].includes(status) ? 'WHERE p.status = ?' : '';
   const args = where ? [status, limit, offset] : [limit, offset];
+  // proof_dupes: other payments sent with the very same picture (one receipt used twice).
   const rows = await db.all(`SELECT p.id, p.txid, p.payer, p.amount, p.status, p.note, p.created_at, p.decided_at,
-      u.id AS user_id, u.name, u.phone
+      u.id AS user_id, u.name, u.phone, p.proof_hash IS NOT NULL AS proof,
+      CASE WHEN p.proof_hash IS NULL THEN 0 ELSE
+        (SELECT COUNT(*) FROM payments q WHERE q.proof_hash = p.proof_hash AND q.id <> p.id) END AS proof_dupes
     FROM payments p JOIN users u ON u.id = p.user_id ${where}
     ORDER BY p.id ${status === 'pending' ? 'ASC' : 'DESC'} LIMIT ? OFFSET ?`, ...args);
   return rows.map((p) => Object.assign(p, { phone: '0' + p.phone, payer: p.payer ? '0' + p.payer : null }));
@@ -529,11 +556,22 @@ route('POST', '/api/admin/payments/:id/approve', async (ctx) => {
     if (row.status !== 'pending') throw new HttpError(409, 'decided', 'This payment was already handled.');
     await t.run(`UPDATE payments SET status = 'approved', decided_at = ${NOW} WHERE id = ?`, pid);
     await t.run(`UPDATE users SET paid = 1, paid_at = COALESCE(paid_at, ${NOW}) WHERE id = ?`, row.user_id);
-    await logAdmin(a.username, 'approve_payment', `#${pid} ${row.txid}`, t);
+    await logAdmin(a.username, 'approve_payment', `#${pid} ${row.txid || 'picture'}`, t);
     return row;
   });
   live.toUser(p.user_id, 'account', { paid: true });
   live.toAdmins('stats');
+});
+
+// The picture sent with a payment. Admins only; the type comes from the file's own bytes.
+route('GET', '/api/admin/payments/:id/proof', async (ctx) => {
+  await requireAdmin(ctx);
+  const p = await db.get('SELECT mime, data FROM payment_proofs WHERE payment_id = ?', id(ctx.params.id));
+  if (!p) throw new HttpError(404, 'not_found', 'No picture for this payment.');
+  const data = Buffer.from(p.data);
+  ctx.res.writeHead(200, { 'Content-Type': p.mime, 'Content-Length': data.length, 'Cache-Control': 'private, no-store' });
+  ctx.res.end(data);
+  return STREAM;
 });
 
 route('POST', '/api/admin/payments/:id/reject', async (ctx) => {

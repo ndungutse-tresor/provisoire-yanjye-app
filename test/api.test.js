@@ -238,6 +238,39 @@ test('same transaction ID cannot be reused by another account', async () => {
   assert.equal(r.body.error, 'txid_used');
 });
 
+test('payment with a picture of the MoMo message instead of a Transaction ID', async () => {
+  // A small JPEG-looking file (the server checks the first bytes) and one that is really SVG.
+  const jpeg = 'data:image/jpeg;base64,' + Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(3000, 7)]).toString('base64');
+  const svg = 'data:image/jpeg;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'.padEnd(1500)).toString('base64');
+  const a = client(), b = client();
+  await a('POST', '/api/auth/register', { name: 'Pacifique P', phone: '0788900001', pin: '5937' });
+  await b('POST', '/api/auth/register', { name: 'Queen Q', phone: '0788900002', pin: '5937' });
+
+  assert.equal((await a('POST', '/api/payments', { proof: svg })).body.error, 'bad_proof');
+  assert.equal((await a('POST', '/api/payments', { proof: 'data:image/svg+xml;base64,PHN2Zz4=' })).body.error, 'bad_proof');
+  assert.equal((await a('POST', '/api/payments', { proof: jpeg })).status, 200);
+  const me = await a('GET', '/api/me');
+  assert.equal(me.body.payment.status, 'pending');
+  assert.equal(me.body.payment.proof, true);
+  assert.equal(me.body.payment.txid, null);
+  // The same picture again from another account is accepted, but flagged for the admin.
+  assert.equal((await b('POST', '/api/payments', { proof: jpeg })).status, 200);
+
+  const list = await admin('GET', '/api/admin/payments?status=pending');
+  const pa = list.body.find((p) => p.phone === '0788900001');
+  assert.equal(pa.proof, true);
+  assert.equal(pa.proof_dupes, 1);
+
+  // Only an admin can open the picture, and it comes back as the JPEG that was sent.
+  assert.equal((await a('GET', `/api/admin/payments/${pa.id}/proof`)).status, 401);
+  const res = await admin('GET', `/api/admin/payments/${pa.id}/proof`);
+  assert.equal(res.headers.get('content-type'), 'image/jpeg');
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+
+  assert.equal((await admin('POST', `/api/admin/payments/${pa.id}/approve`, {})).status, 200);
+  assert.equal((await a('GET', '/api/me')).body.user.paid, true);
+});
+
 test('login lockout after 5 wrong PINs', async () => {
   const c = client();
   for (let i = 0; i < 5; i++) assert.equal((await c('POST', '/api/auth/login', { phone: '0722000111', pin: '0000' })).status, 401);
@@ -325,8 +358,8 @@ test('settings validation and stats', async () => {
   assert.equal(cfg.body.price, 2500);
   assert.equal(cfg.body.categories.length, 2);
   const st = await admin('GET', '/api/admin/stats');
-  assert.equal(st.body.sales, 1);
-  assert.equal(st.body.revenue, 2000);
+  assert.equal(st.body.sales, 2);          // Aline (Transaction ID) and Pacifique (picture)
+  assert.equal(st.body.revenue, 4000);
 });
 
 test('question edit validation', async () => {
