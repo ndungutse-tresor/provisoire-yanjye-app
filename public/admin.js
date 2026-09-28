@@ -67,7 +67,7 @@
     payStatus: 'pending', payments: [],
     users: { q: '', filter: '', list: [], total: 0 },
     questions: null, qSearch: '',
-    imp: { source: 'file', lang: 'rw', content: '', filename: '', url: '', candidates: null, pick: 0, mode: 'replace', busy: false }
+    imp: { source: 'file', lang: 'rw', content: '', filename: '', files: [], url: '', candidates: null, pick: 0, mode: 'replace', busy: false }
   };
   var edit = null;
 
@@ -453,14 +453,15 @@
   function paintImport() {
     var m = A.imp;
     var h = '<div class="head"><h1>Import questions</h1></div>' +
-      '<p class="muted">Connect your existing app here. Load <b>amategeko-yumuhanda.html</b> (or a link to it) and the questions are read out of it. Nothing in the file is run on the server. You can also use a JSON file or a spreadsheet saved as CSV.</p>';
+      '<p class="muted">Connect your existing app here. Load <b>amategeko-yumuhanda.html</b> (or a link to it) and the questions are read out of it. Nothing in the file is run on the server. You can also use a JSON file or a spreadsheet saved as CSV.</p>' +
+      '<p class="muted">If the pictures are in a separate file, choose <b>both files together</b>, e.g. <b>questions.json</b> and <b>images.json</b> (hold Ctrl while clicking).</p>';
 
     h += '<div class="card"><h3>1. Choose the source</h3><div class="tabs">' + [['file', 'File'], ['url', 'Link'], ['paste', 'Paste']].map(function (s) {
       return '<button data-action="imp-source" data-s="' + s[0] + '" aria-pressed="' + (m.source === s[0]) + '">' + s[1] + '</button>';
     }).join('') + '</div><div class="gap"></div>';
     if (m.source === 'file') {
-      h += '<label class="drop">' + icon('upload') + '<div><b>' + (m.filename ? esc(m.filename) : 'Choose a file') + '</b></div>' +
-        '<div class="muted small">.html, .json, .csv or .js, up to 30 MB</div><input type="file" data-bind="imp-file" accept=".html,.htm,.json,.csv,.tsv,.js,.txt"></label>';
+      h += '<label class="drop">' + icon('upload') + '<div><b>' + (m.files.length ? esc(m.files.map(function (f) { return f.filename; }).join(', ')) : 'Choose files') + '</b></div>' +
+        '<div class="muted small">.html, .json, .csv or .js, up to 10 files and 30 MB together</div><input type="file" multiple data-bind="imp-file" accept=".html,.htm,.json,.csv,.tsv,.js,.txt"></label>';
     } else if (m.source === 'url') {
       h += '<label class="field"><span>Link to the file</span><input class="input" data-bind="imp-url" type="url" placeholder="https://…/amategeko-yumuhanda.html" value="' + esc(m.url) + '"></label>' +
         '<p class="help">Pictures stored next to the file online are found automatically when you use a link.</p>';
@@ -480,7 +481,8 @@
           return '<option value="' + i + '"' + (i === m.pick ? ' selected' : '') + '>' + esc(x.path) + ' — ' + x.questions.length + ' questions</option>';
         }).join('') + '</select></label>';
       }
-      h += '<p><b>' + c.questions.length + ' questions</b> ready' + (c.found > c.questions.length ? ' (of ' + c.found + ' items found)' : '') + '.</p>' +
+      h += '<p><b>' + c.questions.length + ' questions</b> ready' + (c.found > c.questions.length ? ' (of ' + c.found + ' items found)' : '') +
+        (c.pictures ? ', <b>' + c.pictures + '</b> with pictures' : '') + '.</p>' +
         '<p class="small muted">Read as: ' + esc(c.mapping) + '</p>';
       c.warnings.forEach(function (w) { h += '<div class="warn">' + esc(w) + '</div>'; });
       c.questions.slice(0, 5).forEach(function (q, i) {
@@ -709,10 +711,13 @@
       if (m.source === 'url') {
         if (!m.url) return toast('Paste a link first.');
         body.url = m.url;
+      } else if (m.source === 'file') {
+        if (!m.files.length) return toast('Choose a file first.');
+        body.files = m.files;
       } else {
-        if (!m.content) return toast(m.source === 'file' ? 'Choose a file first.' : 'Paste something first.');
+        if (!m.content) return toast('Paste something first.');
         body.content = m.content;
-        body.filename = m.source === 'file' ? m.filename : '';
+        body.filename = '';
       }
       m.busy = true;
       paintImport();
@@ -736,6 +741,7 @@
         m.candidates = null;
         m.content = '';
         m.filename = '';
+        m.files = [];
         A.questions = null;
         A.stats = null;
         location.hash = '#/questions';
@@ -797,15 +803,18 @@
     if (b === 'imp-lang') { A.imp.lang = e.target.value; if (A.imp.candidates) { A.imp.candidates = null; paintImport(); } }
     if (b === 'imp-pick') { A.imp.pick = Number(e.target.value); paintImport(); }
     if (b === 'imp-mode') A.imp.mode = e.target.value;
-    if (b === 'imp-file' && e.target.files[0]) {
-      var f = e.target.files[0];
-      if (f.size > 30 * 1024 * 1024) return toast('The file is larger than 30 MB.');
-      f.text().then(function (text) {
-        A.imp.content = text;
-        A.imp.filename = f.name;
+    if (b === 'imp-file' && e.target.files.length) {
+      var picked = Array.prototype.slice.call(e.target.files);
+      if (picked.length > 10) return toast('Choose at most 10 files.');
+      var size = picked.reduce(function (n, f) { return n + f.size; }, 0);
+      if (size > 30 * 1024 * 1024) return toast('The files are larger than 30 MB together.');
+      Promise.all(picked.map(function (f) {
+        return f.text().then(function (text) { return { filename: f.name, content: text }; });
+      })).then(function (files) {
+        A.imp.files = files;
         A.imp.candidates = null;
         paintImport();
-      });
+      }).catch(function () { toast('A file could not be read.'); });
     }
   });
 

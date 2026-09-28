@@ -139,6 +139,46 @@ test('import: CSV with letter answers and a translation merge', async () => {
   assert.equal(all.body[5].text.rw, 'Ikibazo 6: ni iki?');
 });
 
+test('import: questions file plus a separate pictures file', async () => {
+  // Shaped like questions.json + images.json: short keys, pictures named "i0", "i1"...
+  const png = 'data:image/png;base64,iVBORw0KGgo=';
+  const images = { i0: png, i1: png, i2: png, i3: png, i4: png, i5: png };
+  const opt = (l, t, c) => ({ l, t, c });
+  const items = Array.from({ length: 12 }, (_, i) => ({
+    n: i + 1, q: 'Ikibazo ' + i, t: 'text',
+    o: [opt('a', 'A' + i, i % 2 === 0), opt('b', 'B' + i, i % 2 === 1), opt('c', 'C' + i, false)],
+    a: i % 2 === 0 ? 'a' : 'b'
+  }));
+  items[0].il = ['i0'];
+  items[1].il = ['i0', 'i1'];
+  items[2] = { n: 3, q: 'Nikihe cyapa?', t: 'image', a: 'c',
+    o: [{ l: 'a', g: 'i2', c: false }, { l: 'b', g: 'i3', c: false }, { l: 'c', g: 'i4', c: true }, { l: 'd', g: 'i5', c: false }] };
+  const files = [
+    { filename: 'questions.json', content: JSON.stringify(items) },
+    { filename: 'images.json', content: JSON.stringify(images) }
+  ];
+
+  const alone = await admin('POST', '/api/admin/import/parse', { lang: 'rw', files: [files[1]] });
+  assert.equal(alone.status, 422);
+  assert.match(alone.body.message, /pictures file/);
+
+  const noPics = await admin('POST', '/api/admin/import/parse', { lang: 'rw', files: [files[0]] });
+  assert.match(noPics.body.candidates[0].warnings.join(' '), /pictures file was not loaded/);
+
+  const r = await admin('POST', '/api/admin/import/parse', { lang: 'rw', files });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const c = r.body.candidates[0];
+  assert.equal(c.questions.length, 12);
+  assert.equal(c.pictures, 3);
+  assert.equal(c.questions[0].image, png);
+  assert.equal(c.questions[1].answer, 1);
+  assert.match(c.questions[1].image, /^data:image\/svg\+xml;base64,/);   // two pictures combined
+  assert.deepEqual(c.questions[2].options.rw, ['Icyapa A', 'Icyapa B', 'Icyapa C', 'Icyapa D']);
+  assert.equal(c.questions[2].answer, 2);
+  const svg = Buffer.from(c.questions[2].image.split(',')[1], 'base64').toString();
+  assert.equal((svg.match(/<image /g) || []).length, 4);
+});
+
 test('import: rejects files with no questions and private links', async () => {
   const r = await admin('POST', '/api/admin/import/parse', { lang: 'rw', content: '<html><body>hello</body></html>' });
   assert.equal(r.status, 422);

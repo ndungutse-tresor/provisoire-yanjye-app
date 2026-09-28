@@ -735,9 +735,16 @@ route('POST', '/api/admin/import/parse', async (ctx) => {
   const b = await readJson(ctx.req, IMPORT_LIMIT);
   const lang = langOf(b.lang);
   let src;
-  if (b.url) src = await fetchSource(String(b.url));
-  else src = { content: b.content, filename: String(b.filename || ''), baseUrl: null };
-  const candidates = parseSource({ content: src.content, filename: src.filename, lang, baseUrl: src.baseUrl });
+  if (b.url) {
+    src = await fetchSource(String(b.url));
+  } else if (Array.isArray(b.files)) {
+    // Several files at once, e.g. questions.json with its pictures file images.json.
+    const files = b.files.map((f) => ({ content: f && f.content, filename: String((f && f.filename) || '').slice(0, 200) }));
+    src = { files, filename: files.map((f) => f.filename).join(', '), baseUrl: null };
+  } else {
+    src = { content: b.content, filename: String(b.filename || ''), baseUrl: null };
+  }
+  const candidates = parseSource({ content: src.content, filename: src.filename, files: src.files, lang, baseUrl: src.baseUrl });
   await logAdmin(a.username, 'import_read', b.url ? String(b.url).slice(0, 200) : src.filename);
   return { candidates };
 });
