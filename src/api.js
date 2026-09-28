@@ -744,8 +744,15 @@ route('POST', '/api/admin/import/parse', async (ctx) => {
   } else {
     src = { content: b.content, filename: String(b.filename || ''), baseUrl: null };
   }
-  const candidates = parseSource({ content: src.content, filename: src.filename, files: src.files, lang, baseUrl: src.baseUrl });
-  await logAdmin(a.username, 'import_read', b.url ? String(b.url).slice(0, 200) : src.filename);
+  const what = b.url ? String(b.url).slice(0, 200) : src.filename;
+  let candidates;
+  try {
+    candidates = parseSource({ content: src.content, filename: src.filename, files: src.files, lang, baseUrl: src.baseUrl });
+  } catch (e) {
+    if (e instanceof HttpError) await logAdmin(a.username, 'import_failed', `${what}: ${e.message}`);
+    throw e;
+  }
+  await logAdmin(a.username, 'import_read', what);
   return { candidates };
 });
 

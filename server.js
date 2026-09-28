@@ -55,12 +55,19 @@ function serveStatic(req, res, pathname) {
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) return notFound(res);
     const ext = path.extname(file);
-    const fresh = ext === '.html' || rel === 'sw.js' || ext === '.webmanifest';
-    res.writeHead(200, {
+    // Pages, code and styles are checked with the server on every load (a quick "not changed"
+    // answer when they are the same), so an update reaches everyone at once. Pictures are kept an hour.
+    const fresh = ['.html', '.js', '.css', '.webmanifest'].includes(ext);
+    const etag = `W/"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+    const headers = { 'Cache-Control': fresh ? 'no-cache' : 'public, max-age=3600', ETag: etag };
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      return res.end();
+    }
+    res.writeHead(200, Object.assign(headers, {
       'Content-Type': TYPES[ext] || 'application/octet-stream',
-      'Content-Length': st.size,
-      'Cache-Control': fresh ? 'no-cache' : 'public, max-age=3600'
-    });
+      'Content-Length': st.size
+    }));
     if (req.method === 'HEAD') return res.end();
     fs.createReadStream(file).pipe(res);
   });

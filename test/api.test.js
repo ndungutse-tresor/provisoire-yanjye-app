@@ -160,7 +160,11 @@ test('import: questions file plus a separate pictures file', async () => {
 
   const alone = await admin('POST', '/api/admin/import/parse', { lang: 'rw', files: [files[1]] });
   assert.equal(alone.status, 422);
-  assert.match(alone.body.message, /pictures file/);
+  assert.match(alone.body.message, /You chose: images.json. This has 6 pictures but no questions/);
+  const page = await admin('POST', '/api/admin/import/parse', { lang: 'rw', files: [{ filename: 'index.html', content: '<html><body>app</body></html>' }] });
+  assert.match(page.body.message, /You chose: index.html. No question list was found in this file/);
+  const log = await admin('GET', '/api/admin/log');
+  assert.ok(log.body.some((x) => x.action === 'import_failed' && /index.html/.test(x.detail)));
 
   const noPics = await admin('POST', '/api/admin/import/parse', { lang: 'rw', files: [files[0]] });
   assert.match(noPics.body.candidates[0].warnings.join(' '), /pictures file was not loaded/);
@@ -414,6 +418,11 @@ test('MoMo Pay defaults and QR endpoint', async () => {
 });
 
 test('static files and path traversal', async () => {
+  // Code is re-checked on every load, so an update reaches browsers at once.
+  const js = await fetch(BASE + '/admin.js');
+  assert.equal(js.headers.get('cache-control'), 'no-cache');
+  const again = await fetch(BASE + '/admin.js', { headers: { 'If-None-Match': js.headers.get('etag') } });
+  assert.equal(again.status, 304);
   assert.equal((await fetch(BASE + '/..%2fserver.js')).status, 404);
   assert.equal((await fetch(BASE + '/../data/secret.key')).status, 404);
 });

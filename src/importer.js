@@ -422,9 +422,12 @@ function parseSource({ content, filename, files, lang, baseUrl }) {
     .sort((a, b) => b.questions.length - a.questions.length);
 
   if (!candidates.length) {
+    // Name the files, so a wrong pick (e.g. index.html instead of questions.json) is easy to spot.
+    const names = list.map((f) => String(f.filename || '').replace(/^.*[\\/]/, '')).filter(Boolean);
+    const chosen = names.length ? `You chose: ${names.join(', ')}. ` : '';
     throw new HttpError(422, 'no_questions', images.size && !groups.size
-      ? `This looks like a pictures file (${images.size} pictures) with no questions. Choose it together with the questions file.`
-      : 'No question list was found in this file. If your app keeps its questions in a separate file (e.g. questions.json), choose that file, together with its pictures file (e.g. images.json). Otherwise export them to JSON or CSV (columns: question, a, b, c, d, answer, image, explanation, category).');
+      ? `${chosen}This has ${images.size} pictures but no questions. Choose it together with the questions file (e.g. questions.json).`
+      : `${chosen}No question list was found in ${names.length > 1 ? 'these files' : 'this file'}. If your app keeps its questions in a separate file (e.g. questions.json), choose that file together with its pictures file (e.g. images.json). Otherwise export them to JSON or CSV (columns: question, a, b, c, d, answer, image, explanation, category).`);
   }
   return candidates;
 }
