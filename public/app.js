@@ -11,7 +11,8 @@
     get: function (k, d) {
       try { var v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; }
     },
-    set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private mode */ } }
+    set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private mode */ } },
+    remove: function (k) { try { localStorage.removeItem(k); } catch (e) { /* private mode */ } }
   };
 
   var lang = store.get('prov.lang', null);
@@ -79,12 +80,25 @@
     config: null, me: null, payment: null, qs: [], full: false, total: 0, freeCount: 0, loaded: false,
     review: null, examCount: 0, reviews: null
   };
-  var progress = store.get('prov.progress', null) || {};
-  progress.answers = progress.answers || {};
-  progress.pos = progress.pos || {};
-  progress.exams = progress.exams || [];
-  progress.pendingExams = progress.pendingExams || [];
-  function saveProgress() { store.set('prov.progress', progress); }
+  // Progress (answers, mistakes, recent exams, results waiting to be sent) is kept per account,
+  // so on a shared phone nobody sees or sends another learner's data. Guests keep nothing.
+  var LEGACY_PROGRESS = 'prov.progress';   // before per-account progress: one copy for the whole phone
+  function blankProgress() { return { answers: {}, pos: {}, exams: [], pendingExams: [] }; }
+  var progress = blankProgress();
+  var progressUid = null;
+  function saveProgress() { if (progressUid) store.set('prov.progress.' + progressUid, progress); }
+  function useProgressOf(uid) {
+    var legacy = store.get(LEGACY_PROGRESS, null);
+    if (legacy) {
+      // The old shared copy belongs to whoever is logged in when this version first loads.
+      store.remove(LEGACY_PROGRESS);
+      if (uid && !store.get('prov.progress.' + uid, null)) store.set('prov.progress.' + uid, legacy);
+    }
+    if (uid === progressUid) return;
+    progressUid = uid;
+    progress = Object.assign(blankProgress(), (uid && store.get('prov.progress.' + uid, null)) || {});
+    ex = null;   // an exam in progress belongs to the account that started it
+  }
 
   var pr = { key: null, list: [], idx: 0, picked: null, done: {} }; // practice session (done: answers given this session)
   var ex = null;                                                  // running or finished exam
@@ -129,6 +143,7 @@
     ]).then(function (r) {
       S.config = r[0];
       S.me = r[1].user;
+      useProgressOf(S.me ? S.me.id : null);
       S.payment = r[1].payment;
       S.review = r[1].review || null;
       S.examCount = r[1].examCount || 0;
@@ -366,7 +381,8 @@
       return h + trialOverCard() + reviewsBlock(3);
     } else {
       // Free trial, spelled out: what it contains, the 3 steps, and what payment adds.
-      h += '<div class="card trial-card"><h3>' + esc(t('trial_path_title', { n: S.qs.length })) + '</h3><ol class="trial-steps">' +
+      // Visitors have no questions loaded yet, so show how many the trial gives.
+      h += '<div class="card trial-card"><h3>' + esc(t('trial_path_title', { n: S.qs.length || S.freeCount })) + '</h3><ol class="trial-steps">' +
         '<li><a href="#/study">' + icon('study') + '<span>' + esc(t('trial_step1')) + '</span></a></li>' +
         '<li><a href="#/practice">' + icon('book') + '<span>' + esc(t('trial_step2')) + '</span></a></li>' +
         '<li><a href="#/exam">' + icon('timer') + '<span>' + esc(t('trial_step3')) + '</span></a></li>' +

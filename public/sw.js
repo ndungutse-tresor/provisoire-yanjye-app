@@ -1,6 +1,6 @@
 ﻿/* Offline support. The app shell is cached on install; questions and account data use
    network-first so they stay fresh online and still work offline. Admin pages are never cached. */
-var SHELL = 'prov-shell-v11';
+var SHELL = 'prov-shell-v12';
 var DATA = 'prov-data';
 var SHELL_FILES = ['/', '/app.css', '/app.js', '/i18n.js', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-192.png'];
 var DATA_PATHS = ['/api/config', '/api/me', '/api/questions', '/api/reviews', '/api/qr.svg'];
